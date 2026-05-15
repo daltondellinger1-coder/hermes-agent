@@ -1074,6 +1074,8 @@ AUTHOR_MAP = {
     "16034932+Arkmusn@users.noreply.github.com": "Arkmusn",  # PR #25559 salvage (approvals.timeout from config)
     "nidhi2894@gmail.com": "nidhi-singh02",  # PR #2752 salvage (slack whitespace-only IndexError guard)
     "38173192+nidhi-singh02@users.noreply.github.com": "nidhi-singh02",
+    "ade.du@tec-do.com": "Ade5954",  # PR #26084 salvage (TUI completion queue drain)
+    "45689852+Ade5954@users.noreply.github.com": "Ade5954",
 }
 
 

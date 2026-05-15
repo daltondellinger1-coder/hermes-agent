@@ -4649,3 +4649,125 @@ def test_config_show_displays_nested_max_turns(monkeypatch):
     )
 
     assert ["Max Turns", "120"] in agent_rows
+
+
+def test_prompt_submit_drains_completion_queue_after_turn(monkeypatch):
+    """notify_on_complete events are drained and dispatched as follow-up turns."""
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            turns.append(prompt)
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    # Seed a completion event BEFORE the turn starts — it should be
+    # drained AFTER run_conversation() returns.
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_test_drain",
+        "command": "sleep 1",
+        "exit_code": 0,
+        "output": "done",
+    })
+    # Make sure it's not marked as consumed
+    process_registry._completion_consumed.discard("proc_test_drain")
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "do work"},
+            }
+        )
+
+        assert resp["result"]["status"] == "streaming"
+        # First turn is the user prompt, second is the synthetic notification
+        assert len(turns) == 2
+        assert turns[0] == "do work"
+        assert "[IMPORTANT: Background process proc_test_drain completed" in turns[1]
+        assert "exit code 0" in turns[1]
+    finally:
+        server._sessions.pop("sid", None)
+        # Drain any leftover events
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_prompt_submit_skips_consumed_completion(monkeypatch):
+    """Already-consumed completions (via wait/poll/log) are not dispatched."""
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            turns.append(prompt)
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    # Mark this session_id as already consumed
+    process_registry._completion_consumed.add("proc_already_consumed")
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_already_consumed",
+        "command": "sleep 1",
+        "exit_code": 0,
+        "output": "done",
+    })
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "do work"},
+            }
+        )
+
+        assert resp["result"]["status"] == "streaming"
+        # Only the user prompt — consumed completion is skipped
+        assert len(turns) == 1
+        assert turns[0] == "do work"
+    finally:
+        server._sessions.pop("sid", None)
+        process_registry._completion_consumed.discard("proc_already_consumed")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
