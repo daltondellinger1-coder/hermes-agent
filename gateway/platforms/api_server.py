@@ -19,6 +19,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /v1/cockpit/transcribe       — transcribe uploaded cockpit audio with local STT
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -40,6 +41,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -718,6 +720,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._cockpit_stt_model: Optional[Any] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1104,6 +1107,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "cockpit_transcription": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -1132,6 +1136,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "cockpit_transcribe": {"method": "POST", "path": "/v1/cockpit/transcribe"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -1667,6 +1672,89 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+
+    def _transcribe_audio_file(self, path: str) -> str:
+        """Transcribe a cockpit audio upload using local faster-whisper.
+
+        The cockpit records raw microphone audio in the browser and sends it
+        here so Android Chrome's SpeechRecognition quirks are not in the
+        durable path. The model is lazy-loaded on first use to avoid slowing
+        normal API server startup.
+        """
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:  # pragma: no cover - optional runtime dependency
+            raise RuntimeError(
+                "faster-whisper is not installed; install it or configure another STT provider"
+            ) from exc
+
+        if self._cockpit_stt_model is None:
+            model_name = os.getenv("COCKPIT_STT_MODEL") or os.getenv("HERMES_COCKPIT_STT_MODEL") or "base"
+            device = os.getenv("COCKPIT_STT_DEVICE", "cpu")
+            compute_type = os.getenv("COCKPIT_STT_COMPUTE_TYPE", "int8")
+            self._cockpit_stt_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+        segments, _info = self._cockpit_stt_model.transcribe(
+            path,
+            beam_size=1,
+            vad_filter=True,
+            language=os.getenv("COCKPIT_STT_LANGUAGE") or None,
+        )
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+            if getattr(segment, "text", "").strip()
+        )
+        return text.strip()
+
+    async def _handle_cockpit_transcribe(self, request: "web.Request") -> "web.Response":
+        """POST /v1/cockpit/transcribe — transcribe uploaded microphone audio."""
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+
+        tmp_path: Optional[str] = None
+        try:
+            reader = await request.multipart()
+            audio_part = None
+            async for part in reader:
+                if part.name in {"audio", "file"}:
+                    audio_part = part
+                    break
+            if audio_part is None:
+                return web.json_response(
+                    {"error": {"message": "Missing multipart audio field", "type": "invalid_request_error"}},
+                    status=400,
+                )
+
+            suffix = os.path.splitext(audio_part.filename or "cockpit.webm")[1] or ".webm"
+            total = 0
+            with tempfile.NamedTemporaryFile(prefix="hermes-cockpit-", suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+                while True:
+                    chunk = await audio_part.read_chunk(size=256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_REQUEST_BYTES:
+                        return web.json_response(
+                            {"error": {"message": "Audio upload too large", "type": "invalid_request_error"}},
+                            status=413,
+                        )
+                    tmp.write(chunk)
+
+            text = await asyncio.to_thread(self._transcribe_audio_file, tmp_path)
+            return web.json_response({"text": text, "bytes": total})
+        except Exception as exc:
+            logger.exception("[%s] cockpit transcription failed", self.name)
+            return web.json_response({"error": {"message": str(exc), "type": "server_error"}}, status=500)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -4125,6 +4213,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/cockpit/transcribe", self._handle_cockpit_transcribe)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

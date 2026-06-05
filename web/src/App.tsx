@@ -38,6 +38,7 @@ import {
   Plug,
   Puzzle,
   Radio,
+  Mic,
   RotateCw,
   Settings,
   Shield,
@@ -82,6 +83,7 @@ import ChannelsPage from "@/pages/ChannelsPage";
 import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
+import CockpitPage from "@/pages/CockpitPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -139,6 +141,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/cockpit": CockpitPage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -169,6 +172,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     icon: Cpu,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
+  { path: "/cockpit", label: "VIP Cockpit", icon: Mic },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
