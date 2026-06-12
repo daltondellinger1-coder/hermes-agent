@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+set -eu
+
+if command -v gradle >/dev/null 2>&1; then
+  exec gradle "$@"
+fi
+
+cat >&2 <<'EOF'
+Gradle is required to build this prototype, but no system gradle binary was found.
+
+Install Android Studio or a compatible Gradle distribution, then rerun:
+  ./gradlew build
+
+The repository root also includes a lightweight gradle launcher for:
+  ./gradlew -p prototypes/android-pocket-mode build
+EOF
+exit 127

@@ -19,6 +19,11 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /v1/pocket/sessions          — create/register a Pocket Mode session
+- GET  /v1/pocket/sessions/{session_id} — inspect Pocket Mode session/run status
+- POST /v1/pocket/sessions/{session_id}/commands — submit text through existing run path
+- GET  /v1/pocket/sessions/{session_id}/events — SSE proxy for active Pocket Mode run
+- POST /v1/pocket/sessions/{session_id}/stop — stop active Pocket Mode run
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -44,6 +49,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     from aiohttp import web
@@ -725,6 +731,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Pocket Mode sessions are lightweight control-plane records for
+        # mobile clients that need a stable ID across one or more /v1/runs.
+        # They intentionally reuse the existing run machinery instead of
+        # creating a second agent execution path.
+        self._pocket_sessions: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -1117,6 +1128,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "pocket_mode_sessions": True,
+                "pocket_mode_text_commands": True,
+                "pocket_mode_android_phase1": "skeleton_only",
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -1144,6 +1158,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "pocket_session_create": {"method": "POST", "path": "/v1/pocket/sessions"},
+                "pocket_session_status": {"method": "GET", "path": "/v1/pocket/sessions/{session_id}"},
+                "pocket_command": {"method": "POST", "path": "/v1/pocket/sessions/{session_id}/commands"},
+                "pocket_events": {"method": "GET", "path": "/v1/pocket/sessions/{session_id}/events"},
+                "pocket_stop": {"method": "POST", "path": "/v1/pocket/sessions/{session_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -3563,6 +3582,160 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    class _PocketRunRequest:
+        """Small request shim used to route Pocket Mode text into /v1/runs."""
+
+        def __init__(self, source: "web.Request", body: Dict[str, Any], match_info: Optional[Dict[str, str]] = None):
+            self.headers = source.headers
+            self.transport = source.transport
+            self.remote = source.remote
+            self.method = source.method
+            self.path_qs = source.path_qs
+            self.match_info = match_info or {}
+            self._body = body
+
+        async def json(self) -> Dict[str, Any]:
+            return self._body
+
+    def _pocket_session_payload(self, session: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = session.get("active_run_id")
+        run_status = self._run_statuses.get(run_id) if run_id else None
+        payload = dict(session)
+        payload["object"] = "hermes.pocket_session"
+        payload["run_status"] = run_status
+        return payload
+
+    async def _handle_create_pocket_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/pocket/sessions — create a stable Pocket Mode control session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        now = time.time()
+        session_id = str(body.get("session_id") or f"pocket_{uuid.uuid4().hex}").strip()
+        if not session_id or len(session_id) > 128 or re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(_openai_error("Invalid pocket session_id"), status=400)
+        session = {
+            "session_id": session_id,
+            "status": "idle",
+            "created_at": now,
+            "updated_at": now,
+            "label": str(body.get("label") or "Pocket Mode"),
+            "client": str(body.get("client") or "unknown"),
+            "active_run_id": None,
+            "last_command": None,
+        }
+        self._pocket_sessions[session_id] = session
+        return web.json_response(self._pocket_session_payload(session), status=201)
+
+    async def _handle_get_pocket_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/pocket/sessions/{session_id} — return Pocket Mode status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session = self._pocket_sessions.get(session_id)
+        if session is None:
+            return web.json_response(_openai_error(f"Pocket session not found: {session_id}", code="pocket_session_not_found"), status=404)
+        return web.json_response(self._pocket_session_payload(session))
+
+    async def _handle_pocket_command(self, request: "web.Request") -> "web.Response":
+        """POST /v1/pocket/sessions/{session_id}/commands — submit a typed Pocket Mode command.
+
+        Phase 1 intentionally delegates execution to the existing /v1/runs
+        machinery so approvals, event streaming, stop, and tool execution stay
+        on the same path used by the web cockpit.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session = self._pocket_sessions.get(session_id)
+        if session is None:
+            return web.json_response(_openai_error(f"Pocket session not found: {session_id}", code="pocket_session_not_found"), status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        command = str(body.get("command") or body.get("text") or body.get("input") or "").strip()
+        if not command:
+            return web.json_response(_openai_error("Missing command text", code="missing_command"), status=400)
+
+        run_body = {
+            "input": command,
+            "session_id": session_id,
+            "instructions": body.get("instructions") or (
+                "You are in Hermes Pocket Mode. Keep replies concise and voice-friendly. "
+                "Do not send outbound messages or take customer-facing actions without explicit approval."
+            ),
+        }
+        if isinstance(body.get("conversation_history"), list):
+            run_body["conversation_history"] = body["conversation_history"]
+        fake = self._PocketRunRequest(request, run_body)
+        response = await self._handle_runs(fake)  # type: ignore[arg-type]
+        try:
+            data = json.loads(response.text or "{}")
+        except Exception:
+            return response
+        if getattr(response, "status", 200) >= 400:
+            return response
+
+        now = time.time()
+        session.update({
+            "status": "running",
+            "updated_at": now,
+            "active_run_id": data.get("run_id"),
+            "last_command": command,
+        })
+        data.update({
+            "object": "hermes.pocket_command",
+            "pocket_session_id": session_id,
+            "events_url": f"/v1/pocket/sessions/{quote(session_id, safe='')}/events",
+            "status_url": f"/v1/pocket/sessions/{quote(session_id, safe='')}",
+            "run_events_url": f"/v1/runs/{data.get('run_id')}/events" if data.get("run_id") else None,
+            "run_status_url": f"/v1/runs/{data.get('run_id')}" if data.get("run_id") else None,
+        })
+        return web.json_response(data, status=getattr(response, "status", 202))
+
+    async def _handle_stop_pocket_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/pocket/sessions/{session_id}/stop — stop the active Pocket Mode run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session = self._pocket_sessions.get(session_id)
+        if session is None:
+            return web.json_response(_openai_error(f"Pocket session not found: {session_id}", code="pocket_session_not_found"), status=404)
+        run_id = session.get("active_run_id")
+        if not run_id:
+            session.update({"status": "idle", "updated_at": time.time()})
+            return web.json_response({"object": "hermes.pocket_session.stop", "pocket_session_id": session_id, "status": "idle"})
+        fake = self._PocketRunRequest(request, {}, {"run_id": str(run_id)})
+        response = await self._handle_stop_run(fake)  # type: ignore[arg-type]
+        session.update({"status": "stopping", "updated_at": time.time()})
+        return response
+
+    async def _handle_pocket_session_events(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/pocket/sessions/{session_id}/events — proxy to the active run SSE stream."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session = self._pocket_sessions.get(session_id)
+        if session is None:
+            return web.json_response(_openai_error(f"Pocket session not found: {session_id}", code="pocket_session_not_found"), status=404)
+        run_id = session.get("active_run_id")
+        if not run_id:
+            return web.json_response(_openai_error("Pocket session has no active run", code="no_active_run"), status=409)
+        fake = self._PocketRunRequest(request, {}, {"run_id": str(run_id)})
+        return await self._handle_run_events(fake)  # type: ignore[arg-type]
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
@@ -4137,6 +4310,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Pocket Mode Phase 1 control surface.  These endpoints provide a
+            # stable mobile-client session wrapper around the existing run API.
+            self._app.router.add_post("/v1/pocket/sessions", self._handle_create_pocket_session)
+            self._app.router.add_get("/v1/pocket/sessions/{session_id}", self._handle_get_pocket_session)
+            self._app.router.add_post("/v1/pocket/sessions/{session_id}/commands", self._handle_pocket_command)
+            self._app.router.add_get("/v1/pocket/sessions/{session_id}/events", self._handle_pocket_session_events)
+            self._app.router.add_post("/v1/pocket/sessions/{session_id}/stop", self._handle_stop_pocket_session)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

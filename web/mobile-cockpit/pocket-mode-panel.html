@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Hermes Pocket Mode Panel</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080a0f; color: #f7f7f2; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; padding: max(14px, env(safe-area-inset-top)) 14px max(14px, env(safe-area-inset-bottom)); }
+    main { max-width: 680px; margin: 0 auto; }
+    .panel { border: 1px solid rgba(232, 226, 199, .2); border-radius: 8px; background: #11151c; padding: 14px; box-shadow: 0 18px 50px rgba(0,0,0,.34); }
+    .top { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    h1 { margin: 0; font-size: 1.25rem; line-height: 1.1; }
+    .phase { margin: 5px 0 0; color: #b9c0cc; font-size: .88rem; }
+    .pill { border: 1px solid rgba(232, 226, 199, .22); border-radius: 999px; color: #8ee6a8; padding: 5px 8px; font-size: .78rem; white-space: nowrap; }
+    label { display: block; margin: 12px 0 6px; color: #c8ced8; font-size: .86rem; }
+    input, textarea { width: 100%; border-radius: 8px; border: 1px solid rgba(232, 226, 199, .24); background: #07090d; color: #f7f7f2; padding: 11px; font: inherit; }
+    textarea { min-height: 92px; resize: vertical; }
+    .grid { display: grid; gap: 10px; }
+    @media (min-width: 560px) { .grid.two { grid-template-columns: 1fr 1fr; } .grid.actions { grid-template-columns: repeat(4, 1fr); } }
+    .actions { margin-top: 12px; grid-template-columns: 1fr 1fr; }
+    button, a.button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 8px; padding: 11px 12px; font: inherit; font-weight: 700; text-decoration: none; color: #07100a; background: #8ee6a8; }
+    button.secondary, a.secondary { color: #090d12; background: #e3d58a; }
+    button.neutral, a.neutral { color: #f7f7f2; background: #303746; }
+    button.danger { color: #1b0709; background: #ff8b9b; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .links { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .status { margin-top: 12px; padding: 11px; border-radius: 8px; border: 1px solid rgba(232, 226, 199, .15); background: #07090d; color: #dfe7f5; white-space: pre-wrap; min-height: 98px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <div class="top">
+        <div>
+          <h1>Hermes Pocket Mode</h1>
+          <p class="phase">Phase 1 typed command panel. Hotword capture is not included.</p>
+        </div>
+        <span id="state" class="pill">idle</span>
+      </div>
+      <div class="grid two">
+        <div>
+          <label for="base">Hermes base URL</label>
+          <input id="base" placeholder="https://desktop.example.ts.net" />
+        </div>
+        <div>
+          <label for="token">API bearer token</label>
+          <input id="token" type="password" autocomplete="off" placeholder="API_SERVER_KEY" />
+        </div>
+      </div>
+      <label for="command">Command</label>
+      <textarea id="command">Give me a one sentence status check.</textarea>
+      <div class="grid actions">
+        <button id="start">Start</button>
+        <button id="send" class="secondary">Send</button>
+        <button id="refresh" class="neutral">Status</button>
+        <button id="stop" class="danger">Stop</button>
+      </div>
+      <div class="links">
+        <a id="statusLink" class="button neutral" href="#" target="_blank" rel="noopener">Status URL</a>
+        <button id="events" class="neutral">Stream events</button>
+      </div>
+      <pre id="status" class="status">No Pocket session yet.</pre>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    let pocketId = localStorage.getItem('hermes-pocket-session') || '';
+    let abortEvents = null;
+
+    $('base').value = localStorage.getItem('hermes-base') || location.origin;
+    $('token').value = localStorage.getItem('hermes-token') || '';
+
+    function headers() {
+      return {
+        'Authorization': `Bearer ${$('token').value}`,
+        'Content-Type': 'application/json'
+      };
+    }
+    function base() { return $('base').value.replace(/\/$/, ''); }
+    function savePrefs() {
+      localStorage.setItem('hermes-base', $('base').value);
+      localStorage.setItem('hermes-token', $('token').value);
+    }
+    function setState(value) { $('state').textContent = value || 'idle'; }
+    function sessionPath(suffix = '') {
+      return `/v1/pocket/sessions/${encodeURIComponent(pocketId)}${suffix}`;
+    }
+    function updateLinks() {
+      const hasSession = Boolean(pocketId);
+      $('refresh').disabled = !hasSession;
+      $('stop').disabled = !hasSession;
+      $('events').disabled = !hasSession;
+      $('statusLink').href = hasSession ? base() + sessionPath() : '#';
+      $('statusLink').ariaDisabled = hasSession ? 'false' : 'true';
+    }
+    function show(obj) {
+      if (obj && typeof obj === 'object' && obj.status) setState(obj.status);
+      $('status').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+      updateLinks();
+    }
+    async function api(path, opts = {}) {
+      savePrefs();
+      const res = await fetch(base() + path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = text; }
+      if (!res.ok) throw new Error(typeof data === 'string' ? data : JSON.stringify(data));
+      return data;
+    }
+    async function ensureSession() {
+      if (pocketId) return pocketId;
+      const data = await api('/v1/pocket/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ label: 'Mobile Cockpit', client: 'web-panel' })
+      });
+      pocketId = data.session_id;
+      localStorage.setItem('hermes-pocket-session', pocketId);
+      show(data);
+      return pocketId;
+    }
+    $('start').onclick = async () => {
+      try {
+        pocketId = '';
+        localStorage.removeItem('hermes-pocket-session');
+        await ensureSession();
+      } catch (e) { show(String(e)); }
+    };
+    $('refresh').onclick = async () => {
+      if (!pocketId) return show('Start a session first.');
+      try { show(await api(sessionPath())); } catch (e) { show(String(e)); }
+    };
+    $('send').onclick = async () => {
+      try {
+        await ensureSession();
+        show(await api(sessionPath('/commands'), {
+          method: 'POST',
+          body: JSON.stringify({ command: $('command').value })
+        }));
+      } catch (e) { show(String(e)); }
+    };
+    $('stop').onclick = async () => {
+      if (!pocketId) return show('Start a session first.');
+      if (abortEvents) abortEvents.abort();
+      try { show(await api(sessionPath('/stop'), { method: 'POST', body: '{}' })); } catch (e) { show(String(e)); }
+    };
+    $('events').onclick = async () => {
+      if (!pocketId) return show('Start a session first.');
+      if (abortEvents) abortEvents.abort();
+      abortEvents = new AbortController();
+      show('Connecting to Pocket event stream...');
+      try {
+        savePrefs();
+        const res = await fetch(base() + sessionPath('/events'), {
+          headers: headers(),
+          signal: abortEvents.signal
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let output = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          output += decoder.decode(value, { stream: true });
+          $('status').textContent = output || 'Waiting for events...';
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') show(String(e));
+      }
+    };
+    updateLinks();
+  </script>
+</body>
+</html>
