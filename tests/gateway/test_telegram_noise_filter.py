@@ -31,6 +31,14 @@ def test_non_telegram_status_is_unchanged():
     assert _prepare_gateway_status_message("local", "lifecycle", message) == message
 
 
+def test_context_compaction_status_suppressed_for_discord():
+    """Context-compaction lifecycle chatter should never hit chat platforms."""
+    message = "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
+
+    assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) is None
+    assert _prepare_gateway_status_message("local", "lifecycle", message) is None
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (
@@ -81,3 +89,17 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_context_compaction_final_response_is_not_delivered_to_discord():
+    raw = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+        "into the summary below. Respond ONLY to the latest user message.\n"
+        "Summary generation was unavailable."
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.DISCORD, raw)
+
+    assert "CONTEXT COMPACTION" not in sanitized
+    assert "Summary generation was unavailable" not in sanitized
+    assert "internal compaction handoff was suppressed" in sanitized

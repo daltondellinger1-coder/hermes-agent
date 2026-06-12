@@ -67,6 +67,16 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_UNIVERSAL_NOISY_STATUS_RE = re.compile(
+    r"("  # internal lifecycle chatter that should stay in logs, not user chats
+    r"compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|compression\s+summary\s+failed"
+    r"|fallback\s+context\s+marker"
+    r"|configured\s+compression\s+model\s+.+\s+failed"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -83,6 +93,11 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CONTEXT_COMPACTION_FINAL_RESPONSE_RE = re.compile(
+    r"^\s*\[CONTEXT\s+COMPACTION\b.*?(?:Summary generation was unavailable\.|##\s+Active\s+Task|Respond ONLY to the latest user message)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -294,25 +309,33 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
+    text = _redact_gateway_user_facing_secrets(text)
+    if _CONTEXT_COMPACTION_FINAL_RESPONSE_RE.search(text):
+        return "I’m continuing from the latest message — the internal compaction handoff was suppressed."
     if _gateway_platform_value(platform) != "telegram":
         return text
 
-    redacted = _redact_gateway_user_facing_secrets(str(text))
-    if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
-    return redacted
+    if _looks_like_gateway_provider_error(text):
+        return _gateway_provider_error_reply(text)
+    return text
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
-    """Filter/sanitize agent status callbacks before platform delivery."""
+    """Filter/sanitize agent status callbacks before platform delivery.
+
+    Routine infrastructure chatter (compression progress, retry backoff,
+    auxiliary-model fallbacks) is useful in logs but noisy in every chat
+    platform. Suppress it before delivery so Discord/Telegram/etc. do not
+    get spammed by repeated internal status updates during long turns.
+    """
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
-        return text
 
     text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
+    if _UNIVERSAL_NOISY_STATUS_RE.search(text):
+        return None
+    if _gateway_platform_value(platform) == "telegram" and _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
