@@ -1,0 +1,40 @@
+#!/bin/sh
+# Resolve a working WSL interoperability socket. Socket names are per-session
+# and change across boots, so never hardcode one.
+
+windows_cmd=/mnt/c/Windows/System32/cmd.exe
+fallback=
+selected=
+
+probe_socket() {
+    [ -S "$1" ] || return 1
+    [ -x "$windows_cmd" ] || return 1
+    timeout 2 env WSL_INTEROP="$1" "$windows_cmd" /c exit 0 >/dev/null 2>&1
+}
+
+if [ -n "${WSL_INTEROP:-}" ] && probe_socket "$WSL_INTEROP"; then
+    selected=$WSL_INTEROP
+else
+    for candidate in $(ls -1t /run/WSL/*_interop 2>/dev/null); do
+        [ -S "$candidate" ] || continue
+        [ -n "$fallback" ] || fallback=$candidate
+        if probe_socket "$candidate"; then
+            selected=$candidate
+            break
+        fi
+    done
+fi
+
+if [ "${1:-}" = "--print-socket" ]; then
+    [ -n "$selected" ] || exit 1
+    printf '%s\n' "$selected"
+    exit 0
+fi
+
+# Hardened units may hide /mnt/c during wrapper startup. In that case retain
+# the newest socket candidate for descendants, matching the existing service
+# behavior. Login profiles use --print-socket and accept only a proven socket.
+[ -n "$selected" ] || selected=$fallback
+[ -n "$selected" ] && export WSL_INTEROP=$selected
+
+exec "$@"
