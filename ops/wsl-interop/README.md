@@ -4,7 +4,10 @@
 ACP services and agent shells. `--print-socket` prints only a socket proven
 with a real Windows command. Print mode bounds each candidate to 400 ms; the
 login hook delegates with a two-second outer timeout and exports itself as `BASH_ENV`, covering non-login,
-non-interactive Bash descendants. The `buzz-acp@.service` template drop-in
+non-interactive Bash descendants. The wrapper atomically caches its last proven
+socket under the user runtime directory; `BASH_ENV` descendants consume that
+cache because Windows probes are unreliable during Bash startup. Login and
+systemd boundaries refresh it. The `buzz-acp@.service` template drop-in
 wraps every current or future ACP instance instead of patching instances one
 at a time.
 

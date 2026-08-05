@@ -7,6 +7,8 @@ fallback=
 selected=
 probe_timeout=2
 [ "${1:-}" = "--print-socket" ] && probe_timeout=0.4
+runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+cache_path=$runtime_dir/hermes-wsl-interop.socket
 
 probe_socket() {
     [ -S "$1" ] || return 1
@@ -25,6 +27,12 @@ else
             break
         fi
     done
+fi
+
+if [ -n "$selected" ] && [ -d "$runtime_dir" ]; then
+    cache_tmp=$cache_path.$$
+    (umask 077 && printf '%s\n' "$selected" >"$cache_tmp")
+    mv -f -- "$cache_tmp" "$cache_path"
 fi
 
 if [ "${1:-}" = "--print-socket" ]; then
