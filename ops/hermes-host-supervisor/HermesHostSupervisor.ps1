@@ -101,8 +101,10 @@ function Read-SupervisorState {
         $State = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
         $DefaultState = New-DefaultState
         foreach ($Property in $DefaultState.PSObject.Properties.Name) {
-            if ($State.PSObject.Properties.Name -notcontains $Property) {
-                $State | Add-Member -NotePropertyName $Property -NotePropertyValue $DefaultState.$Property
+            $ExistingProperty = @($State.PSObject.Properties.Match($Property)) | Select-Object -First 1
+            if ($null -eq $ExistingProperty -or
+                ($null -eq $ExistingProperty.Value -and $null -ne $DefaultState.$Property)) {
+                $State | Add-Member -NotePropertyName $Property -NotePropertyValue $DefaultState.$Property -Force
             }
         }
         return $State

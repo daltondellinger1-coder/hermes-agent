@@ -88,6 +88,8 @@ try {
         LastHealthyUtc = $null
         LastRecoveryUtc = $null
         RecoveryCount = 67
+        ConsecutiveRecoveryFailures = $null
+        RecoverySuspended = $null
         LastOutcome = "healthy"
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LegacyDirectory "state.json") -Encoding UTF8
     & $SupervisorPath -DataDirectory $LegacyDirectory -NoRemediation -HealthProbe { $true }
