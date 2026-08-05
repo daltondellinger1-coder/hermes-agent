@@ -26531,6 +26531,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.debug("Nous auth keepalive did not start: %s", exc)
 
     _ensure_windows_gateway_venv_imports()
+    try:
+        from tools.dependency_preflight import write_report
+        from tools.mcp_tool import _load_mcp_config
+        dependency_report = write_report(_load_mcp_config())
+        if dependency_report["issues"]:
+            logger.error(
+                "Dependency preflight quarantined %d broken entrypoint(s); "
+                "see ~/.hermes/state/dependency-preflight.json",
+                len(dependency_report["issues"]),
+            )
+    except Exception as exc:
+        logger.error("Dependency preflight could not complete: %s", exc)
 
     # MCP tool discovery — run in an executor so the asyncio event loop
     # stays responsive even when a configured MCP server is slow or

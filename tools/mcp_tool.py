@@ -3587,12 +3587,23 @@ def _record_connect_failure(server_name: str) -> None:
         _CONNECT_RETRY_MAX_BACKOFF_SEC,
     )
     _server_connect_retry_after[server_name] = time.monotonic() + backoff
+    if n >= 3:
+        try:
+            from tools.dependency_preflight import record_runtime_quarantine
+            record_runtime_quarantine(server_name)
+        except Exception as exc:
+            logger.warning("Could not publish MCP quarantine for '%s': %s", server_name, exc)
 
 
 def _clear_connect_failure(server_name: str) -> None:
     """Clear the connect-cooldown state after a successful connection."""
     _server_connect_failures.pop(server_name, None)
     _server_connect_retry_after.pop(server_name, None)
+    try:
+        from tools.dependency_preflight import clear_runtime_quarantine
+        clear_runtime_quarantine(server_name)
+    except Exception as exc:
+        logger.warning("Could not clear MCP quarantine for '%s': %s", server_name, exc)
 
 
 def _connect_cooldown_active(server_name: str) -> bool:
@@ -6235,6 +6246,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         return []
 
     servers = _filter_suspicious_mcp_servers(servers)
+    try:
+        from tools.dependency_preflight import filter_quarantined_servers
+        servers = filter_quarantined_servers(servers)
+    except Exception as exc:
+        logger.warning("MCP dependency preflight failed open: %s", exc)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []

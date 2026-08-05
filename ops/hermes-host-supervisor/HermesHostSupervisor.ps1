@@ -32,6 +32,7 @@ param(
     [scriptblock]$TailscaleStarter,
     [scriptblock]$ReliabilitySignalProbe,
     [scriptblock]$HostPressureProbe,
+    [scriptblock]$DependencyReportProbe,
     [scriptblock]$AlertTransport
 )
 
@@ -126,6 +127,7 @@ function New-DefaultState {
         RestartStormActiveUnits = [pscustomobject]@{}
         PressureHighConsecutive = 0
         PressureAlertActive = $false
+        ActiveDependencyIssueIds = @()
         LastOutcome = "new"
     }
 }
@@ -346,6 +348,47 @@ function Invoke-PressureAlarm {
     }
 }
 
+function Invoke-DependencyPreflightAlerts {
+    param([Parameter(Mandatory = $true)]$State)
+
+    try {
+        if ($null -ne $DependencyReportProbe) {
+            $Report = & $DependencyReportProbe
+        }
+        else {
+            $Result = Invoke-ProcessWithTimeout `
+                -FilePath "$env:SystemRoot\System32\wsl.exe" `
+                -Arguments "-d $Distro -u $LinuxUser --exec /usr/bin/cat /home/$LinuxUser/.hermes/state/dependency-preflight.json" `
+                -TimeoutSeconds 10
+            if ($Result.ExitCode -ne 0 -or $Result.TimedOut -or [string]::IsNullOrWhiteSpace($Result.Output)) { return }
+            $Report = $Result.Output | ConvertFrom-Json
+        }
+        $PriorIds = @($State.ActiveDependencyIssueIds)
+        $CurrentIds = @()
+        foreach ($Issue in @($Report.issues)) {
+            if ($PriorIds -contains [string]$Issue.id) {
+                $CurrentIds += [string]$Issue.id
+            }
+            else {
+                $ConditionId = ([string]$Issue.id) -replace '[^A-Za-z0-9_.-]', '-'
+                $Problem = if ([string]$Issue.module -eq "<server-startup>") {
+                    "server startup failed repeatedly"
+                }
+                else { "missing module '$($Issue.module)'" }
+                Send-SupervisorAlert `
+                    -Condition ("dependency-preflight-" + $ConditionId) `
+                    -Action "$($Issue.kind) '$($Issue.name)' is quarantined: $Problem. Fix: $($Issue.fix)" `
+                    -State $State
+                if ($script:LastAlertSent) { $CurrentIds += [string]$Issue.id }
+            }
+        }
+        $State.ActiveDependencyIssueIds = @($CurrentIds)
+    }
+    catch {
+        Write-SupervisorLog -Level WARN -Message "Dependency preflight report was unreadable: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-ProcessWithTimeout {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -443,6 +486,7 @@ function Send-SupervisorAlert {
         [Parameter(Mandatory = $true)]$State
     )
 
+    $script:LastAlertSent = $false
     if (-not $AlertModuleAvailable) {
         Write-SupervisorLog -Level WARN -Message "Hermes alert module is unavailable for condition '$Condition'."
         return
@@ -463,6 +507,7 @@ function Send-SupervisorAlert {
             -WarningSink { param($Text) Write-SupervisorLog -Level WARN -Message $Text } `
             -Transport $AlertTransport
         if ($Result.Sent) {
+            $script:LastAlertSent = $true
             Save-SupervisorState -State $State
             Write-SupervisorLog -Message "Hermes alert sent for condition '$Condition' (Telegram API acknowledged)."
         }
@@ -690,6 +735,7 @@ if ($ResetTailscaleSuspension) {
 $script:LastHealthDetail = "Hermes health not checked yet"
 Invoke-TailscaleWatchdog -State $State
 Invoke-ReliabilityAlarms -State $State
+Invoke-DependencyPreflightAlerts -State $State
 $Now = (Get-Date).ToUniversalTime()
 $State.LastCheckUtc = $Now.ToString("o")
 $Pressure = Get-HostPressure

@@ -99,6 +99,49 @@ try {
         throw "Legacy state did not migrate recovery-cap fields to safe defaults."
     }
 
+    $DependencyDirectory = Join-Path $TestDirectory "dependency-preflight"
+    New-Item -ItemType Directory -Path $DependencyDirectory -Force | Out-Null
+    $DependencyAlertCountPath = Join-Path $DependencyDirectory "transport-count.txt"
+    $DependencyAlertBodyPath = Join-Path $DependencyDirectory "transport-body.txt"
+    $env:HERMES_DEPENDENCY_TEST_COUNT = $DependencyAlertCountPath
+    $env:HERMES_DEPENDENCY_TEST_BODY = $DependencyAlertBodyPath
+    $DependencyTransport = {
+        param($Uri, $Body, $TimeoutSec)
+        Add-Content -LiteralPath $env:HERMES_DEPENDENCY_TEST_COUNT -Value "sent"
+        Set-Content -LiteralPath $env:HERMES_DEPENDENCY_TEST_BODY -Value $Body.text
+        [pscustomobject]@{ ok = $true }
+    }
+    $DependencyReport = {
+        [pscustomobject]@{ issues = @([pscustomobject]@{
+            id = "mcp:secure_login:bcrypt"
+            kind = "mcp"
+            name = "secure_login"
+            module = "bcrypt"
+            fix = "/scratch/bin/python -m pip install bcrypt"
+        }) }
+    }
+    1..2 | ForEach-Object {
+        & $SupervisorPath `
+            -DataDirectory $DependencyDirectory `
+            -AlertConfigPath $AlertConfigPath `
+            -HealthProbe { $true } `
+            -DependencyReportProbe $DependencyReport `
+            -AlertTransport $DependencyTransport `
+            -NoRemediation
+    }
+    $DependencyAlertCalls = @(Get-Content -LiteralPath $DependencyAlertCountPath).Count
+    $DependencyAlertText = Get-Content -LiteralPath $DependencyAlertBodyPath -Raw
+    if ($DependencyAlertCalls -ne 1) {
+        throw "One persistent dependency issue produced $DependencyAlertCalls alerts instead of exactly one."
+    }
+    if ($DependencyAlertText -notmatch "secure_login" -or
+        $DependencyAlertText -notmatch "bcrypt" -or
+        $DependencyAlertText -notmatch "pip install bcrypt") {
+        throw "Dependency alert did not name the server, module, and fix."
+    }
+    Remove-Item Env:HERMES_DEPENDENCY_TEST_COUNT -ErrorAction SilentlyContinue
+    Remove-Item Env:HERMES_DEPENDENCY_TEST_BODY -ErrorAction SilentlyContinue
+
     $ProbeFaultDirectory = Join-Path $TestDirectory "probe-fault"
     $ProbeTracker = [pscustomobject]@{ ShutdownCalls = 0 }
     $AllGoodEvidence = {
