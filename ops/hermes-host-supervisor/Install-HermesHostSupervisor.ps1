@@ -1,19 +1,64 @@
 [CmdletBinding()]
 param(
-    [string]$TaskName = "Hermes-Host-Supervisor"
+    [string]$TaskName = "Hermes-Host-Supervisor",
+    [string]$InstallDirectory = (Join-Path $env:USERPROFILE ".hermes-supervisor"),
+    [switch]$SkipTaskRegistration
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$SupervisorPath = Join-Path $PSScriptRoot "HermesHostSupervisor.ps1"
-if (-not (Test-Path -LiteralPath $SupervisorPath)) {
-    throw "Supervisor script not found: $SupervisorPath"
+$SourceDirectory = [System.IO.Path]::GetFullPath($PSScriptRoot)
+$InstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
+if ($SourceDirectory.TrimEnd('\') -eq $InstallDirectory.TrimEnd('\')) {
+    throw "Run this installer from the repository, not from the live install directory: $InstallDirectory"
 }
 
-$LauncherPath = Join-Path $PSScriptRoot "HermesHostSupervisorLauncher.exe"
-if (-not (Test-Path -LiteralPath $LauncherPath)) {
-    throw "No-console launcher not found: $LauncherPath"
+$SourceFiles = @(
+    "HermesHostSupervisor.ps1",
+    "HermesHostSupervisorLoop.ps1",
+    "HermesHostSupervisorLauncher.cs",
+    "Install-HermesHostSupervisor.ps1",
+    "Test-HermesHostSupervisor.ps1",
+    "README.md"
+)
+
+foreach ($FileName in $SourceFiles) {
+    $SourcePath = Join-Path $SourceDirectory $FileName
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw "Required repository source file not found: $SourcePath"
+    }
+}
+
+$BackupStamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
+
+foreach ($FileName in $SourceFiles) {
+    $SourcePath = Join-Path $SourceDirectory $FileName
+    $DestinationPath = Join-Path $InstallDirectory $FileName
+    if (Test-Path -LiteralPath $DestinationPath) {
+        Copy-Item -LiteralPath $DestinationPath -Destination "$DestinationPath.bak-$BackupStamp" -Force
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
+}
+
+$LauncherPath = Join-Path $InstallDirectory "HermesHostSupervisorLauncher.exe"
+if (Test-Path -LiteralPath $LauncherPath) {
+    Copy-Item -LiteralPath $LauncherPath -Destination "$LauncherPath.bak-$BackupStamp" -Force
+    Remove-Item -LiteralPath $LauncherPath -Force
+}
+Add-Type `
+    -Path (Join-Path $InstallDirectory "HermesHostSupervisorLauncher.cs") `
+    -OutputAssembly $LauncherPath `
+    -OutputType WindowsApplication
+
+if (-not (Test-Path -LiteralPath $LauncherPath -PathType Leaf)) {
+    throw "No-console launcher compilation failed: $LauncherPath"
+}
+
+if ($SkipTaskRegistration) {
+    Write-Output "Deployed Hermes host supervisor without changing the Scheduled Task: $InstallDirectory"
+    exit 0
 }
 
 $Action = New-ScheduledTaskAction -Execute $LauncherPath

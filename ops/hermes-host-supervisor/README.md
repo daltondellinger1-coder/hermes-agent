@@ -6,6 +6,7 @@ Hermes's internal watchdog cannot.
 
 ## Installed behavior
 
+- Live deployment: `C:\Users\Dalton\.hermes-supervisor`
 - Scheduled Task: `Hermes-Host-Supervisor`
 - Frequency: every two minutes and at Windows logon
 - Health endpoint: `http://127.0.0.1:8646/health/detailed`
@@ -28,6 +29,22 @@ Chrome processes are never terminated automatically.
 The Scheduled Task launches the supervisor through the bundled no-console
 launcher. This avoids creating a Windows Terminal/OpenConsole host for every
 two-minute health check.
+
+## Source and deployment
+
+The files in this repository are the source of truth. Never edit the live copy
+under `C:\Users\Dalton\.hermes-supervisor` directly. Make and review changes in
+the repository, then deploy from a PowerShell prompt with:
+
+```powershell
+& ".\Install-HermesHostSupervisor.ps1"
+```
+
+The installer copies the repository files to the live directory, compiles the
+no-console launcher there, and creates timestamped `.bak-*` copies of every
+file it replaces before updating the `Hermes-Host-Supervisor` Scheduled Task.
+Use `-SkipTaskRegistration` only when validating deployment into a throwaway
+directory.
 
 ## WSL containment
 
@@ -64,5 +81,8 @@ For the final `WslService` fallback, open PowerShell as Administrator once and
 run:
 
 ```powershell
-& "$env:USERPROFILE\.hermes-supervisor\Install-HermesHostSupervisor.ps1"
+Set-Location "C:\path\to\hermes-agent\ops\hermes-host-supervisor"
+& ".\Install-HermesHostSupervisor.ps1"
 ```
+
+The live copy intentionally refuses to install over itself.
