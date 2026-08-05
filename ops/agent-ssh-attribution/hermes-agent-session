@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 || ! "$1" =~ ^(claude|codex)$ ]]; then
+  echo "invalid agent identity" >&2
+  exit 64
+fi
+
+agent_identity="$1"
+login_uid="$(cat /proc/self/loginuid 2>/dev/null || printf 'unknown')"
+audit_session="$(cat /proc/self/sessionid 2>/dev/null || printf 'unknown')"
+logger --tag hermes-agent-ssh -- \
+  "agent=${agent_identity} ssh_user=${USER:-unknown} loginuid=${login_uid} audit_session=${audit_session} leader_pid=$$ source=${SSH_CONNECTION:-unknown} command=${SSH_ORIGINAL_COMMAND:+present}"
+
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+  exec sudo -iu dalton -- /bin/bash -lc "$SSH_ORIGINAL_COMMAND"
+fi
+
+exec sudo -iu dalton -- /bin/bash -l

@@ -1,0 +1,4 @@
+-a always,exit -F arch=b64 -F dir=/home/dalton/.hermes -F perm=wa -F auid=@CLAUDE_UID@ -F key=hermes_agent_changes
+-a always,exit -F arch=b64 -F dir=/home/dalton/.hermes -F perm=wa -F auid=@CODEX_UID@ -F key=hermes_agent_changes
+-a always,exit -F arch=b64 -F dir=/home/dalton/.buzz -F perm=wa -F auid=@CLAUDE_UID@ -F key=hermes_agent_changes
+-a always,exit -F arch=b64 -F dir=/home/dalton/.buzz -F perm=wa -F auid=@CODEX_UID@ -F key=hermes_agent_changes

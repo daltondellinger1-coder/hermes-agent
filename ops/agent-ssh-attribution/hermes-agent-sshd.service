@@ -1,0 +1,19 @@
+[Unit]
+Description=Tailnet-only SSH endpoint for attributable Hermes agent sessions
+After=network-online.target tailscaled.service auditd.service
+Wants=network-online.target
+Requires=auditd.service
+
+[Service]
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/hermes-agent-sshd_config
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/hermes-agent-sshd_config
+ExecReload=/usr/sbin/sshd -t -f /etc/ssh/hermes-agent-sshd_config
+KillMode=process
+Restart=on-failure
+RestartPreventExitStatus=255
+Type=notify
+RuntimeDirectory=hermes-agent-sshd
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+Port @PORT@
+ListenAddress @LISTEN_ADDRESS@
+AddressFamily inet
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile /run/hermes-agent-sshd/sshd.pid
+AuthorizedKeysFile .ssh/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+UsePAM yes
+LogLevel VERBOSE
+AllowUsers hermes-claude hermes-codex
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTunnel no
+PermitUserEnvironment no
+PermitTTY yes
+PrintMotd no
+
+Match User hermes-claude
+    ForceCommand /usr/local/sbin/hermes-agent-session claude
+
+Match User hermes-codex
+    ForceCommand /usr/local/sbin/hermes-agent-session codex
