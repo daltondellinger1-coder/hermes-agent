@@ -2,6 +2,8 @@
 param(
     [string]$TaskName = "Hermes-Host-Supervisor",
     [string]$InstallDirectory = (Join-Path $env:USERPROFILE ".hermes-supervisor"),
+    [string]$HermesEnvPath = "\\wsl.localhost\Ubuntu\home\dalton\.hermes\.env",
+    [string]$HermesConfigPath = "\\wsl.localhost\Ubuntu\home\dalton\.hermes\config.yaml",
     [switch]$SkipTaskRegistration
 )
 
@@ -17,6 +19,7 @@ if ($SourceDirectory.TrimEnd('\') -eq $InstallDirectory.TrimEnd('\')) {
 $SourceFiles = @(
     "HermesHostSupervisor.ps1",
     "HermesHostSupervisorLoop.ps1",
+    "HermesAlert.psm1",
     "HermesHostSupervisorLauncher.cs",
     "Install-HermesHostSupervisor.ps1",
     "Test-HermesHostSupervisor.ps1",
@@ -41,6 +44,61 @@ foreach ($FileName in $SourceFiles) {
     }
     Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
 }
+
+if (-not (Test-Path -LiteralPath $HermesEnvPath -PathType Leaf)) {
+    throw "Hermes environment file not found: $HermesEnvPath"
+}
+if (-not (Test-Path -LiteralPath $HermesConfigPath -PathType Leaf)) {
+    throw "Hermes config file not found: $HermesConfigPath"
+}
+
+$TokenLine = Get-Content -LiteralPath $HermesEnvPath |
+    Where-Object { $_ -match '^TELEGRAM_BOT_TOKEN=' } |
+    Select-Object -First 1
+$BotToken = if ($null -ne $TokenLine) { [string]$TokenLine.Substring($TokenLine.IndexOf('=') + 1) } else { "" }
+
+$InGateway = $false
+$InGatewayTelegram = $false
+$ChatId = ""
+foreach ($Line in (Get-Content -LiteralPath $HermesConfigPath)) {
+    if ($Line -match '^gateway:\s*$') {
+        $InGateway = $true
+        continue
+    }
+    if ($InGateway -and $Line -match '^\S') {
+        break
+    }
+    if ($InGateway -and $Line -match '^  telegram:\s*$') {
+        $InGatewayTelegram = $true
+        continue
+    }
+    if ($InGatewayTelegram -and $Line -match '^  \S') {
+        break
+    }
+    if ($InGatewayTelegram -and $Line -match '^    allowed_ids:\s*(.+?)\s*$') {
+        $AllowedIdMatches = [regex]::Matches([string]$Matches[1], '-?\d+')
+        if ($AllowedIdMatches.Count -eq 1) {
+            $ChatId = [string]$AllowedIdMatches[0].Value
+        }
+        break
+    }
+}
+if ([string]::IsNullOrWhiteSpace($BotToken) -or $ChatId -notmatch '^-?\d+$') {
+    throw "Existing Telegram bot token or Dalton chat id could not be read cleanly."
+}
+
+$AlertConfigPath = Join-Path $InstallDirectory "alert.config.json"
+$TemporaryAlertConfigPath = "$AlertConfigPath.tmp"
+[pscustomobject]@{ bot_token = $BotToken; chat_id = $ChatId } |
+    ConvertTo-Json |
+    Set-Content -LiteralPath $TemporaryAlertConfigPath -Encoding UTF8
+& "$env:SystemRoot\System32\icacls.exe" $TemporaryAlertConfigPath `
+    /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item -LiteralPath $TemporaryAlertConfigPath -Force -ErrorAction SilentlyContinue
+    throw "Could not restrict the Hermes alert config ACL."
+}
+Move-Item -LiteralPath $TemporaryAlertConfigPath -Destination $AlertConfigPath -Force
 
 $LauncherPath = Join-Path $InstallDirectory "HermesHostSupervisorLauncher.exe"
 if (Test-Path -LiteralPath $LauncherPath) {

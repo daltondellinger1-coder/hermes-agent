@@ -14,6 +14,8 @@ Hermes's internal watchdog cannot.
 - Recovery threshold: three consecutive failed checks
 - Recovery cooldown: twenty minutes
 - State and logs: `C:\Users\Dalton\.hermes-supervisor\data`
+- Out-of-band alerts: Telegram Bot API direct from Windows, rate-limited per
+  condition to one message every thirty minutes
 
 Recovery is graded:
 
@@ -45,6 +47,13 @@ no-console launcher there, and creates timestamped `.bak-*` copies of every
 file it replaces before updating the `Hermes-Host-Supervisor` Scheduled Task.
 Use `-SkipTaskRegistration` only when validating deployment into a throwaway
 directory.
+
+At install time, the existing Hermes Telegram token and Dalton chat id are
+copied from the WSL-side Hermes configuration into
+`C:\Users\Dalton\.hermes-supervisor\alert.config.json`. The installer removes
+inherited ACLs and grants access only to Dalton. Runtime alerts read only this
+Windows-side file; sending an outage alert does not depend on WSL or Hermes.
+Never commit, log, or manually copy the contents of `alert.config.json`.
 
 ## WSL containment
 

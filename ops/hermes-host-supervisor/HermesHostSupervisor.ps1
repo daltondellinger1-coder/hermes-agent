@@ -32,6 +32,13 @@ if ($WslStartRetrySeconds -lt 0) {
 
 $StatePath = Join-Path $DataDirectory "state.json"
 $LogPath = Join-Path $DataDirectory "supervisor.log"
+$AlertConfigPath = Join-Path $PSScriptRoot "alert.config.json"
+$AlertModuleAvailable = $false
+try {
+    Import-Module (Join-Path $PSScriptRoot "HermesAlert.psm1") -Force -ErrorAction Stop
+    $AlertModuleAvailable = $true
+}
+catch { }
 
 function Initialize-DataDirectory {
     if (-not (Test-Path -LiteralPath $DataDirectory)) {
@@ -273,6 +280,40 @@ function Send-RecoveryNotice {
     }
 }
 
+function Send-SupervisorAlert {
+    param(
+        [Parameter(Mandatory = $true)][string]$Condition,
+        [Parameter(Mandatory = $true)][string]$Action,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    if (-not $AlertModuleAvailable) {
+        Write-SupervisorLog -Level WARN -Message "Hermes alert module is unavailable for condition '$Condition'."
+        return
+    }
+
+    try {
+        $Text = @(
+            "Hermes host supervisor: $Condition",
+            "Health: $script:LastHealthDetail",
+            "Consecutive failures: $($State.ConsecutiveFailures)",
+            "Action: $Action"
+        ) -join [Environment]::NewLine
+        $Result = Send-HermesAlert `
+            -Condition $Condition `
+            -Message $Text `
+            -State $State `
+            -ConfigPath $AlertConfigPath `
+            -WarningSink { param($Text) Write-SupervisorLog -Level WARN -Message $Text }
+        if ($Result.Sent) {
+            Save-SupervisorState -State $State
+        }
+    }
+    catch {
+        Write-SupervisorLog -Level WARN -Message "Hermes alert handling failed for condition '$Condition'."
+    }
+}
+
 function Invoke-HermesRecovery {
     $WslArguments = "--distribution `"$Distro`" --user `"$LinuxUser`""
     $Probe = Invoke-ProcessWithTimeout -FilePath "$env:SystemRoot\System32\wsl.exe" -Arguments "$WslArguments --exec /bin/true" -TimeoutSeconds 12
@@ -362,6 +403,10 @@ if ($NoRemediation) {
     $State.LastOutcome = "no-remediation"
     Save-SupervisorState -State $State
     Write-SupervisorLog -Level WARN -Message "Failure threshold reached, but remediation is disabled for this run."
+    Send-SupervisorAlert `
+        -Condition "health-failure-no-remediation" `
+        -Action "Remediation is disabled; inspect Hermes manually." `
+        -State $State
     exit 0
 }
 
@@ -383,6 +428,10 @@ $State.RecoveryCount = [int]$State.RecoveryCount + 1
 $State.LastOutcome = "recovering"
 Save-SupervisorState -State $State
 Write-SupervisorLog -Level WARN -Message "Failure threshold reached; beginning graded Hermes recovery."
+Send-SupervisorAlert `
+    -Condition "recovery-started" `
+    -Action "Beginning graded recovery." `
+    -State $State
 
 $Outcome = Invoke-HermesRecovery
 $State.LastOutcome = $Outcome
@@ -391,9 +440,17 @@ if ($Outcome -eq "gateway-restarted" -or $Outcome -eq "wsl-restarted") {
     $State.LastHealthyUtc = (Get-Date).ToUniversalTime().ToString("o")
     Write-SupervisorLog -Message "Hermes recovery succeeded: $Outcome."
     Send-RecoveryNotice -Message "Hermes recovered automatically ($Outcome)."
+    Send-SupervisorAlert `
+        -Condition "recovery-succeeded" `
+        -Action "Recovery completed: $Outcome." `
+        -State $State
 }
 else {
     Write-SupervisorLog -Level ERROR -Message "Hermes recovery failed; manual inspection is required."
     Send-RecoveryNotice -Message "Hermes automatic recovery failed. Check the Hermes supervisor log."
+    Send-SupervisorAlert `
+        -Condition "recovery-failed" `
+        -Action "Automatic recovery failed; manual inspection is required." `
+        -State $State
 }
 Save-SupervisorState -State $State
