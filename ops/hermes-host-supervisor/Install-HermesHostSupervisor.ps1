@@ -95,13 +95,20 @@ function New-SupervisorTask {
 
 try {
     $Task = New-SupervisorTask -RunLevel Highest
-    Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force | Out-Null
+    Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force -ErrorAction Stop | Out-Null
     Write-Output "Installed scheduled task with highest privileges: $TaskName"
 }
 catch {
+    $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $ExistingAction = @($ExistingTask.Actions | Where-Object { $_.Execute -eq $LauncherPath })
+    if ($null -ne $ExistingTask -and $ExistingAction.Count -gt 0) {
+        Write-Warning "Could not replace the existing elevated task, but it already targets the deployed launcher: $LauncherPath"
+        exit 0
+    }
+
     try {
         $Task = New-SupervisorTask -RunLevel Limited
-        Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force | Out-Null
+        Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force -ErrorAction Stop | Out-Null
         Write-Warning "Installed $TaskName at normal user privilege. WSL and gateway recovery are enabled; restarting WslService after a hung wsl --shutdown still requires a one-time elevated reinstall."
     }
     catch {
