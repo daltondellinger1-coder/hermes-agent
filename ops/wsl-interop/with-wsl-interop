@@ -5,11 +5,13 @@
 windows_cmd=/mnt/c/Windows/System32/cmd.exe
 fallback=
 selected=
+probe_timeout=2
+[ "${1:-}" = "--print-socket" ] && probe_timeout=0.4
 
 probe_socket() {
     [ -S "$1" ] || return 1
     [ -x "$windows_cmd" ] || return 1
-    timeout 2 env WSL_INTEROP="$1" "$windows_cmd" /c exit 0 >/dev/null 2>&1
+    timeout "$probe_timeout" env WSL_INTEROP="$1" "$windows_cmd" /c exit 0 >/dev/null 2>&1
 }
 
 if [ -n "${WSL_INTEROP:-}" ] && probe_socket "$WSL_INTEROP"; then
