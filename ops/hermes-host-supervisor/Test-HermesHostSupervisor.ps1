@@ -269,6 +269,67 @@ try {
         throw "Privilege-blocked recovery was not classified distinctly."
     }
 
+    $FixturePath = Join-Path $PSScriptRoot "fixtures\health-detailed.json"
+    $FixtureText = Get-Content -LiteralPath $FixturePath -Raw
+    $FixturePayload = $FixtureText | ConvertFrom-Json
+
+    function Invoke-ContractCase {
+        param(
+            [AllowEmptyString()][string]$Content,
+            [int]$StatusCode = 200
+        )
+        $CaseDirectory = Join-Path $TestDirectory ("contract-" + [guid]::NewGuid().ToString("N"))
+        $CaseContent = $Content
+        $CaseStatus = $StatusCode
+        $Request = {
+            param($Uri, $TimeoutSeconds)
+            [pscustomobject]@{ StatusCode = $CaseStatus; Content = $CaseContent }
+        }.GetNewClosure()
+        & $SupervisorPath `
+            -FailureThreshold 1 `
+            -DataDirectory $CaseDirectory `
+            -AlertConfigPath $AlertConfigPath `
+            -WebRequestInvoker $Request `
+            -NoRemediation `
+            -AlertTransport $SupervisorTransport
+        [pscustomobject]@{
+            State = Get-Content (Join-Path $CaseDirectory "state.json") -Raw | ConvertFrom-Json
+            Log = (Get-Content (Join-Path $CaseDirectory "supervisor.log") -Raw -ErrorAction SilentlyContinue)
+        }
+    }
+
+    $Case = Invoke-ContractCase -Content $FixtureText
+    if ($Case.State.LastOutcome -ne "healthy") {
+        throw "Captured real health fixture did not validate as healthy."
+    }
+
+    foreach ($InvalidContent in @("{not-json", "")) {
+        $Case = Invoke-ContractCase -Content $InvalidContent
+        if ($Case.State.LastOutcome -ne "no-remediation") {
+            throw "Malformed or empty payload escaped the unhealthy contract."
+        }
+    }
+    $Case = Invoke-ContractCase -Content "server error" -StatusCode 500
+    if ($Case.State.LastOutcome -ne "no-remediation" -or $Case.Log -notmatch "HTTP 500") {
+        throw "HTTP 500 escaped the unhealthy contract."
+    }
+
+    $LivePayload = (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8646/health/detailed" -TimeoutSec 4).Content | ConvertFrom-Json
+    foreach ($Property in $FixturePayload.PSObject.Properties.Name) {
+        if (@($LivePayload.PSObject.Properties.Match($Property)).Count -ne 1) {
+            throw "Live health payload drifted: missing top-level property $Property."
+        }
+    }
+    foreach ($Platform in $FixturePayload.platforms.PSObject.Properties.Name) {
+        $LivePlatform = @($LivePayload.platforms.PSObject.Properties.Match($Platform)) | Select-Object -First 1
+        if ($null -eq $LivePlatform) { throw "Live health payload drifted: missing platform $Platform." }
+        foreach ($Property in $FixturePayload.platforms.$Platform.PSObject.Properties.Name) {
+            if (@($LivePlatform.Value.PSObject.Properties.Match($Property)).Count -ne 1) {
+                throw "Live health payload drifted: $Platform missing property $Property."
+            }
+        }
+    }
+
     Write-Output "Hermes host supervisor tests passed."
 }
 finally {

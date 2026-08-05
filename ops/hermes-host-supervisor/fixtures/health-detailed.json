@@ -1,0 +1,30 @@
+{
+  "status": "ok",
+  "readiness": {
+    "status": "ok",
+    "checks": {
+      "state_db": { "status": "ok" },
+      "config": { "status": "ok" },
+      "model": { "status": "ok" },
+      "disk": { "status": "ok", "used_percent": 12.6, "free_bytes": 889482739712 },
+      "gateway": { "status": "ok", "state": "running", "connected_platforms": 5, "platforms": 5 },
+      "background_queues": { "status": "ok", "active_api_runs": 0, "process_completions": 0, "active_delegations": 0 }
+    }
+  },
+  "platform": "hermes-agent",
+  "version": "0.20.0",
+  "gateway_state": "running",
+  "platforms": {
+    "telegram": { "state": "connected", "error_code": null, "error_message": null, "updated_at": "2026-08-04T19:43:10.500292+00:00" },
+    "api_server": { "state": "connected", "error_code": null, "error_message": null, "updated_at": "2026-08-04T19:42:57.477137+00:00" },
+    "discord": { "state": "connected", "error_code": null, "error_message": null, "updated_at": "2026-08-04T19:43:13.638315+00:00" },
+    "webhook": { "state": "connected", "error_code": null, "error_message": null, "updated_at": "2026-08-04T19:42:57.501008+00:00" },
+    "feishu": { "state": "connected", "error_code": null, "error_message": null, "updated_at": "2026-07-22T17:49:08.126788+00:00" }
+  },
+  "active_agents": 0,
+  "gateway_busy": false,
+  "gateway_drainable": true,
+  "exit_reason": null,
+  "updated_at": "2026-08-05T01:24:05.575261+00:00",
+  "pid": 55024
+}

@@ -15,6 +15,7 @@ param(
     [switch]$NoRemediation,
     [switch]$ResetRecoverySuspension,
     [scriptblock]$HealthProbe,
+    [scriptblock]$WebRequestInvoker,
     [scriptblock]$ProcessInvoker,
     [scriptblock]$RecoveryInvoker,
     [scriptblock]$ServiceRestarter,
@@ -47,9 +48,15 @@ if ([string]::IsNullOrWhiteSpace($AlertConfigPath)) {
     $AlertConfigPath = Join-Path $PSScriptRoot "alert.config.json"
 }
 $AlertModuleAvailable = $false
+$HealthContractAvailable = $false
 try {
     Import-Module (Join-Path $PSScriptRoot "HermesAlert.psm1") -Force -ErrorAction Stop
     $AlertModuleAvailable = $true
+}
+catch { }
+try {
+    Import-Module (Join-Path $PSScriptRoot "HermesHealthContract.psm1") -Force -ErrorAction Stop
+    $HealthContractAvailable = $true
 }
 catch { }
 
@@ -137,52 +144,26 @@ function Test-HermesHealth {
             return $false
         }
     }
+    if (-not $HealthContractAvailable) {
+        $script:LastHealthDetail = "health contract module unavailable"
+        return $false
+    }
     try {
-        $Response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 4
+        $Response = if ($null -ne $WebRequestInvoker) {
+            & $WebRequestInvoker $HealthUrl 4
+        }
+        else {
+            Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 4
+        }
         if ($Response.StatusCode -ne 200) {
             $script:LastHealthDetail = "HTTP $($Response.StatusCode)"
             return $false
         }
-
-        try {
-            $Payload = $Response.Content | ConvertFrom-Json
-            if ($Payload.status -ne "ok") {
-                $script:LastHealthDetail = "status=$($Payload.status)"
-                return $false
-            }
-            if ($Payload.gateway_state -ne "running") {
-                $script:LastHealthDetail = "gateway_state=$($Payload.gateway_state)"
-                return $false
-            }
-            if ($null -eq $Payload.platforms) {
-                $script:LastHealthDetail = "platform status missing"
-                return $false
-            }
-
-            $Unhealthy = @()
-            foreach ($Platform in $RequiredPlatforms) {
-                $Entry = $Payload.platforms.PSObject.Properties[$Platform]
-                if ($null -eq $Entry -or $null -eq $Entry.Value) {
-                    $Unhealthy += "$Platform=missing"
-                    continue
-                }
-                $State = [string]$Entry.Value.state
-                if ($State -ne "connected") {
-                    $Unhealthy += "$Platform=$State"
-                }
-            }
-            if ($Unhealthy.Count -gt 0) {
-                $script:LastHealthDetail = ($Unhealthy -join ",")
-                return $false
-            }
-
-            $script:LastHealthDetail = "gateway and required platforms connected"
-            return $true
-        }
-        catch {
-            $script:LastHealthDetail = "invalid detailed health payload"
-            return $false
-        }
+        $Validation = Test-HermesHealthPayload `
+            -Content ([string]$Response.Content) `
+            -RequiredPlatforms $RequiredPlatforms
+        $script:LastHealthDetail = [string]$Validation.Detail
+        return [bool]$Validation.Healthy
     }
     catch {
         $script:LastHealthDetail = $_.Exception.GetType().Name

@@ -83,6 +83,17 @@ run that command while WSL work is active.
 
 ## Validation
 
+The fixture-only health contract is portable and runs in CI on
+`ubuntu-latest` whenever supervisor files change:
+
+```powershell
+pwsh -File ".\Test-HermesHealthContract.ps1"
+```
+
+It validates the captured detailed-health schema without HTTP, Windows
+services, Scheduled Tasks, or WSL. The host integration suite remains Windows
+only and additionally checks the live endpoint and recovery state machine.
+
 Run the non-destructive test suite:
 
 ```powershell

@@ -20,10 +20,13 @@ $SourceFiles = @(
     "HermesHostSupervisor.ps1",
     "HermesHostSupervisorLoop.ps1",
     "HermesAlert.psm1",
+    "HermesHealthContract.psm1",
     "HermesHostSupervisorLauncher.cs",
     "Install-HermesHostSupervisor.ps1",
     "Test-HermesHostSupervisor.ps1",
-    "README.md"
+    "Test-HermesHealthContract.ps1",
+    "README.md",
+    "fixtures\health-detailed.json"
 )
 
 foreach ($FileName in $SourceFiles) {
@@ -39,6 +42,8 @@ New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
 foreach ($FileName in $SourceFiles) {
     $SourcePath = Join-Path $SourceDirectory $FileName
     $DestinationPath = Join-Path $InstallDirectory $FileName
+    $DestinationParent = Split-Path -Parent $DestinationPath
+    New-Item -ItemType Directory -Path $DestinationParent -Force | Out-Null
     if (Test-Path -LiteralPath $DestinationPath) {
         Copy-Item -LiteralPath $DestinationPath -Destination "$DestinationPath.bak-$BackupStamp" -Force
     }
