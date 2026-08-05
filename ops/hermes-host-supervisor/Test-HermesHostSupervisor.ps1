@@ -136,7 +136,7 @@ try {
             $GatewayTracker.Shutdowns++
             return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = ""; Error = "" }
         }
-        if ($Arguments -match 'systemctl.*restart') {
+        if ($Arguments -match 'systemctl.*\srestart\s') {
             $GatewayTracker.Restarts++
             return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; Output = ""; Error = "failed" }
         }
@@ -335,6 +335,81 @@ try {
     if ($TailscaleNoRemediationTracker.StartCalls -ne 0 -or
         [int]$State.TailscaleConsecutiveRestartFailures -ne 0 -or $State.TailscaleRecoverySuspended) {
         throw "No-remediation Tailscale check attempted or counted a restart."
+    }
+
+    $BootFixture = Get-Content (Join-Path $PSScriptRoot "fixtures\journalctl-list-boots-storm.txt") -Raw
+    $BootAlarmDirectory = Join-Path $TestDirectory "boot-alarm"
+    $BootAlertTracker = [pscustomobject]@{ Calls = 0 }
+    $BootTransport = { param($Uri, $Body, $TimeoutSec) $BootAlertTracker.Calls++; [pscustomobject]@{ ok = $true } }.GetNewClosure()
+    $BootInvoker = {
+        param($FilePath, $Arguments, $TimeoutSeconds)
+        if ($Arguments -match 'journalctl --list-boots') {
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = $BootFixture; Error = "" }
+        }
+        [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = ""; Error = "" }
+    }.GetNewClosure()
+    1..2 | ForEach-Object {
+        & $SupervisorPath -DataDirectory $BootAlarmDirectory -HealthProbe { $true } `
+            -TailscaleProcessProbe { $true } -ProcessInvoker $BootInvoker `
+            -ReliabilityNowUtc ([datetime]"2026-08-04T16:20:05Z") `
+            -AlertConfigPath $AlertConfigPath -AlertTransport $BootTransport
+    }
+    $State = Get-Content (Join-Path $BootAlarmDirectory "state.json") -Raw | ConvertFrom-Json
+    if (-not $State.BootStormActive -or $BootAlertTracker.Calls -ne 1) {
+        throw "Real boot-storm fixture did not emit exactly one alert."
+    }
+
+    $RestartAlarmDirectory = Join-Path $TestDirectory "restart-alarm"
+    $RestartAlertTracker = [pscustomobject]@{ Calls = 0; Count = 0 }
+    $RestartTransport = { param($Uri, $Body, $TimeoutSec) $RestartAlertTracker.Calls++; [pscustomobject]@{ ok = $true } }.GetNewClosure()
+    0, 5, 10 | ForEach-Object {
+        $RestartAlertTracker.Count = $_
+        $RestartProbe = {
+            [pscustomobject]@{
+                BootCountLastHour = 1
+                RestartCounts = [pscustomobject]@{ 'dalton-goals-dashboard.service' = $RestartAlertTracker.Count }
+            }
+        }.GetNewClosure()
+        & $SupervisorPath -DataDirectory $RestartAlarmDirectory -HealthProbe { $true } `
+            -TailscaleProcessProbe { $true } -ReliabilitySignalProbe $RestartProbe `
+            -AlertConfigPath $AlertConfigPath -AlertTransport $RestartTransport
+    }
+    $State = Get-Content (Join-Path $RestartAlarmDirectory "state.json") -Raw | ConvertFrom-Json
+    if ($RestartAlertTracker.Calls -ne 1 -or
+        -not $State.RestartStormActiveUnits.'dalton-goals-dashboard.service') {
+        throw "Restart storm emitted $($RestartAlertTracker.Calls) transports instead of one."
+    }
+
+    $PressureAlarmDirectory = Join-Path $TestDirectory "pressure-alarm"
+    $PressureAlertTracker = [pscustomobject]@{ Calls = 0 }
+    $PressureTransport = { param($Uri, $Body, $TimeoutSec) $PressureAlertTracker.Calls++; [pscustomobject]@{ ok = $true } }.GetNewClosure()
+    1..4 | ForEach-Object {
+        & $SupervisorPath -DataDirectory $PressureAlarmDirectory -HealthProbe { $true } `
+            -TailscaleProcessProbe { $true } `
+            -ReliabilitySignalProbe { [pscustomobject]@{ BootCountLastHour = 1; RestartCounts = [pscustomobject]@{} } } `
+            -HostPressureProbe { [pscustomobject]@{ CommitPercent = 90; ChromePrivateGB = 1; WslPrivateGB = 2 } } `
+            -PressureSustainedSamples 3 -AlertConfigPath $AlertConfigPath -AlertTransport $PressureTransport
+    }
+    $State = Get-Content (Join-Path $PressureAlarmDirectory "state.json") -Raw | ConvertFrom-Json
+    $PressureLines = @(Get-Content (Join-Path $PressureAlarmDirectory "host-pressure.jsonl"))
+    if ($PressureAlertTracker.Calls -ne 1 -or -not $State.PressureAlertActive -or
+        [int]$State.PressureHighConsecutive -ne 4 -or $PressureLines.Count -ne 4) {
+        throw "Sustained pressure did not emit one alert and four structured samples."
+    }
+
+    $PressureRotationDirectory = Join-Path $TestDirectory "pressure-rotation"
+    New-Item -ItemType Directory -Path $PressureRotationDirectory -Force | Out-Null
+    Set-Content (Join-Path $PressureRotationDirectory "host-pressure.jsonl") -Value "current-old-sample" -Encoding UTF8
+    Set-Content (Join-Path $PressureRotationDirectory "host-pressure.jsonl.1") -Value "older-sample" -Encoding UTF8
+    & $SupervisorPath -DataDirectory $PressureRotationDirectory -HealthProbe { $true } `
+        -TailscaleProcessProbe { $true } `
+        -ReliabilitySignalProbe { [pscustomobject]@{ BootCountLastHour = 1; RestartCounts = [pscustomobject]@{} } } `
+        -HostPressureProbe { [pscustomobject]@{ CommitPercent = 30; ChromePrivateGB = 0; WslPrivateGB = 3 } } `
+        -PressureLogMaxBytes 5 -PressureLogRetention 2
+    if ((Get-Content (Join-Path $PressureRotationDirectory "host-pressure.jsonl.1") -Raw) -notmatch "current-old-sample" -or
+        (Get-Content (Join-Path $PressureRotationDirectory "host-pressure.jsonl.2") -Raw) -notmatch "older-sample" -or
+        @(Get-Content (Join-Path $PressureRotationDirectory "host-pressure.jsonl")).Count -ne 1) {
+        throw "Pressure JSONL rotation did not retain the configured generations."
     }
 
     $FixturePath = Join-Path $PSScriptRoot "fixtures\health-detailed.json"

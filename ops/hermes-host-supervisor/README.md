@@ -53,6 +53,13 @@ that latch explicitly:
 
 Validate tailnet reachability with `tailscale ping`, not plain `ping`.
 
+Each supervisor cycle also reads Linux boot and systemd restart counters through
+`wsl --exec`. More than two boots in an hour and a five-restart increase between
+samples alert through the same Windows Telegram transport. Host pressure uses
+the existing commit/Chrome/`vmmemWSL` sample, writes rotated
+`data\host-pressure.jsonl` (10 MB plus four retained generations), and alerts only after three consecutive high
+samples. No second collector, token, or rate-limit state exists in WSL.
+
 High Windows commit, Chrome memory, and WSL memory are logged, but healthy
 Chrome processes are never terminated automatically.
 

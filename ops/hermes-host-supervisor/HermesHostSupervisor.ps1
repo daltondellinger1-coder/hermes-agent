@@ -9,6 +9,12 @@ param(
     [int]$MaxConsecutiveRecoveryFailures = 3,
     [int]$MaxTailscaleRestartFailures = 3,
     [int]$TailscaleStartWaitSeconds = 2,
+    [int]$BootAlarmThreshold = 2,
+    [int]$RestartStormThreshold = 5,
+    [int]$PressureSustainedSamples = 3,
+    [int]$PressureLogMaxBytes = 10MB,
+    [int]$PressureLogRetention = 4,
+    [datetime]$ReliabilityNowUtc = [datetime]::MinValue,
     [int]$WslStartAttempts = 6,
     [int]$WslStartRetrySeconds = 5,
     [string]$DataDirectory = "",
@@ -24,6 +30,8 @@ param(
     [scriptblock]$ServiceRestarter,
     [scriptblock]$TailscaleProcessProbe,
     [scriptblock]$TailscaleStarter,
+    [scriptblock]$ReliabilitySignalProbe,
+    [scriptblock]$HostPressureProbe,
     [scriptblock]$AlertTransport
 )
 
@@ -49,12 +57,17 @@ if ($MaxTailscaleRestartFailures -lt 1) {
 if ($TailscaleStartWaitSeconds -lt 0) {
     throw "TailscaleStartWaitSeconds cannot be negative."
 }
+if ($BootAlarmThreshold -lt 1 -or $RestartStormThreshold -lt 1 -or $PressureSustainedSamples -lt 1 -or
+    $PressureLogMaxBytes -lt 1 -or $PressureLogRetention -lt 1) {
+    throw "Reliability alarm thresholds must be at least 1."
+}
 if ($WslStartRetrySeconds -lt 0) {
     throw "WslStartRetrySeconds cannot be negative."
 }
 
 $StatePath = Join-Path $DataDirectory "state.json"
 $LogPath = Join-Path $DataDirectory "supervisor.log"
+$PressureLogPath = Join-Path $DataDirectory "host-pressure.jsonl"
 if ([string]::IsNullOrWhiteSpace($AlertConfigPath)) {
     $AlertConfigPath = Join-Path $PSScriptRoot "alert.config.json"
 }
@@ -108,6 +121,11 @@ function New-DefaultState {
         LastRecoveryFailureOutcome = $null
         TailscaleConsecutiveRestartFailures = 0
         TailscaleRecoverySuspended = $false
+        BootStormActive = $false
+        RestartStormBaselines = [pscustomobject]@{}
+        RestartStormActiveUnits = [pscustomobject]@{}
+        PressureHighConsecutive = 0
+        PressureAlertActive = $false
         LastOutcome = "new"
     }
 }
@@ -185,6 +203,9 @@ function Test-HermesHealth {
 }
 
 function Get-HostPressure {
+    if ($null -ne $HostPressureProbe) {
+        return & $HostPressureProbe
+    }
     $Result = [ordered]@{
         CommitPercent = $null
         ChromePrivateGB = 0.0
@@ -216,6 +237,113 @@ function Get-HostPressure {
     }
 
     [pscustomobject]$Result
+}
+
+function Write-PressureSample {
+    param([Parameter(Mandatory = $true)]$Pressure)
+
+    Initialize-DataDirectory
+    if ((Test-Path -LiteralPath $PressureLogPath) -and (Get-Item -LiteralPath $PressureLogPath).Length -gt $PressureLogMaxBytes) {
+        for ($Index = $PressureLogRetention; $Index -ge 1; $Index--) {
+            $Source = if ($Index -eq 1) { $PressureLogPath } else { "$PressureLogPath.$($Index - 1)" }
+            $Destination = "$PressureLogPath.$Index"
+            if (Test-Path -LiteralPath $Source) {
+                Move-Item -LiteralPath $Source -Destination $Destination -Force
+            }
+        }
+    }
+    [ordered]@{
+        timestamp_utc = (Get-Date).ToUniversalTime().ToString("o")
+        commit_percent = $Pressure.CommitPercent
+        chrome_private_gb = $Pressure.ChromePrivateGB
+        wsl_private_gb = $Pressure.WslPrivateGB
+    } | ConvertTo-Json -Compress | Add-Content -LiteralPath $PressureLogPath -Encoding UTF8
+}
+
+function Get-ReliabilitySignals {
+    if ($null -ne $ReliabilitySignalProbe) {
+        return & $ReliabilitySignalProbe
+    }
+
+    $Boots = Invoke-ProcessWithTimeout `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -Arguments "-d $Distro -u $LinuxUser --exec /usr/bin/journalctl --list-boots --no-pager" `
+        -TimeoutSeconds 15
+    $BootCount = $null
+    if ($Boots.ExitCode -eq 0 -and -not $Boots.TimedOut) {
+        $ObservedUtc = if ($ReliabilityNowUtc -eq [datetime]::MinValue) { (Get-Date).ToUniversalTime() } else { $ReliabilityNowUtc.ToUniversalTime() }
+        $CutoffLocal = $ObservedUtc.ToLocalTime().AddHours(-1)
+        $BootCount = 0
+        foreach ($Line in @($Boots.Output -split "`r?`n")) {
+            if ($Line -match '^\s*-?\d+\s+[0-9a-f]+\s+\w{3}\s+(?<started>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+\S+') {
+                $Started = [datetime]::ParseExact($Matches.started, "yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+                if ($Started -ge $CutoffLocal) { $BootCount++ }
+            }
+        }
+    }
+
+    $Restarts = Invoke-ProcessWithTimeout `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -Arguments "-d $Distro -u $LinuxUser --exec /usr/bin/systemctl --user show --type=service --all -p Id -p NRestarts" `
+        -TimeoutSeconds 15
+    $RestartCounts = [ordered]@{}
+    if ($Restarts.ExitCode -eq 0 -and -not $Restarts.TimedOut) {
+        foreach ($Block in @($Restarts.Output -split "(?:`r?`n){2,}")) {
+            $IdMatch = [regex]::Match($Block, '(?m)^Id=(.+\.service)$')
+            $CountMatch = [regex]::Match($Block, '(?m)^NRestarts=(\d+)$')
+            if ($IdMatch.Success -and $CountMatch.Success) {
+                $RestartCounts[$IdMatch.Groups[1].Value] = [int]$CountMatch.Groups[1].Value
+            }
+        }
+    }
+    [pscustomobject]@{ BootCountLastHour = $BootCount; RestartCounts = [pscustomobject]$RestartCounts }
+}
+
+function Invoke-ReliabilityAlarms {
+    param([Parameter(Mandatory = $true)]$State)
+
+    $Signals = Get-ReliabilitySignals
+    if ($null -ne $Signals.BootCountLastHour) {
+        $Storming = [int]$Signals.BootCountLastHour -gt $BootAlarmThreshold
+        if ($Storming -and -not $State.BootStormActive) {
+            $State.BootStormActive = $true
+            Send-SupervisorAlert -Condition "wsl-boot-storm" -Action "$($Signals.BootCountLastHour) WSL boots occurred in the last hour." -State $State
+        }
+        elseif (-not $Storming) { $State.BootStormActive = $false }
+    }
+
+    foreach ($Property in @($Signals.RestartCounts.PSObject.Properties)) {
+        $Prior = @($State.RestartStormBaselines.PSObject.Properties.Match($Property.Name)) | Select-Object -First 1
+        if ($null -ne $Prior) {
+            $Delta = [int]$Property.Value - [int]$Prior.Value
+            $Active = @($State.RestartStormActiveUnits.PSObject.Properties.Match($Property.Name)) | Select-Object -First 1
+            $WasActive = $null -ne $Active -and [bool]$Active.Value
+            if ($Delta -ge $RestartStormThreshold -and -not $WasActive) {
+                Send-SupervisorAlert -Condition ("restart-storm-" + $Property.Name) -Action "$($Property.Name) restarted $Delta times since the prior supervisor sample." -State $State
+                $State.RestartStormActiveUnits | Add-Member -NotePropertyName $Property.Name -NotePropertyValue $true -Force
+            }
+            elseif ($Delta -lt $RestartStormThreshold) {
+                $State.RestartStormActiveUnits | Add-Member -NotePropertyName $Property.Name -NotePropertyValue $false -Force
+            }
+        }
+        $State.RestartStormBaselines | Add-Member -NotePropertyName $Property.Name -NotePropertyValue ([int]$Property.Value) -Force
+    }
+}
+
+function Invoke-PressureAlarm {
+    param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)]$Pressure)
+
+    $High = (($null -ne $Pressure.CommitPercent -and $Pressure.CommitPercent -ge 85) -or
+        $Pressure.ChromePrivateGB -ge 12 -or $Pressure.WslPrivateGB -ge 9)
+    if ($High) { $State.PressureHighConsecutive = [int]$State.PressureHighConsecutive + 1 }
+    else {
+        $State.PressureHighConsecutive = 0
+        $State.PressureAlertActive = $false
+    }
+    if ($High -and [int]$State.PressureHighConsecutive -ge $PressureSustainedSamples -and -not $State.PressureAlertActive) {
+        $State.PressureAlertActive = $true
+        Send-SupervisorAlert -Condition "sustained-host-pressure" -Action "Host pressure remained high for $($State.PressureHighConsecutive) samples: commit=$($Pressure.CommitPercent)% chrome=$($Pressure.ChromePrivateGB)GB wsl=$($Pressure.WslPrivateGB)GB." -State $State
+    }
 }
 
 function Invoke-ProcessWithTimeout {
@@ -561,9 +689,12 @@ if ($ResetTailscaleSuspension) {
 }
 $script:LastHealthDetail = "Hermes health not checked yet"
 Invoke-TailscaleWatchdog -State $State
+Invoke-ReliabilityAlarms -State $State
 $Now = (Get-Date).ToUniversalTime()
 $State.LastCheckUtc = $Now.ToString("o")
 $Pressure = Get-HostPressure
+Write-PressureSample -Pressure $Pressure
+Invoke-PressureAlarm -State $State -Pressure $Pressure
 
 if (($null -ne $Pressure.CommitPercent -and $Pressure.CommitPercent -ge 85) -or
     $Pressure.ChromePrivateGB -ge 12 -or $Pressure.WslPrivateGB -ge 9) {

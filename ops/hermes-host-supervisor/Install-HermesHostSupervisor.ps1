@@ -26,7 +26,8 @@ $SourceFiles = @(
     "Test-HermesHostSupervisor.ps1",
     "Test-HermesHealthContract.ps1",
     "README.md",
-    "fixtures\health-detailed.json"
+    "fixtures\health-detailed.json",
+    "fixtures\journalctl-list-boots-storm.txt"
 )
 
 foreach ($FileName in $SourceFiles) {
