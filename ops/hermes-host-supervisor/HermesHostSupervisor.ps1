@@ -7,6 +7,8 @@ param(
     [int]$FailureThreshold = 3,
     [int]$RecoveryCooldownMinutes = 20,
     [int]$MaxConsecutiveRecoveryFailures = 3,
+    [int]$MaxTailscaleRestartFailures = 3,
+    [int]$TailscaleStartWaitSeconds = 2,
     [int]$WslStartAttempts = 6,
     [int]$WslStartRetrySeconds = 5,
     [string]$DataDirectory = "",
@@ -14,11 +16,14 @@ param(
     [switch]$AlwaysLog,
     [switch]$NoRemediation,
     [switch]$ResetRecoverySuspension,
+    [switch]$ResetTailscaleSuspension,
     [scriptblock]$HealthProbe,
     [scriptblock]$WebRequestInvoker,
     [scriptblock]$ProcessInvoker,
     [scriptblock]$RecoveryInvoker,
     [scriptblock]$ServiceRestarter,
+    [scriptblock]$TailscaleProcessProbe,
+    [scriptblock]$TailscaleStarter,
     [scriptblock]$AlertTransport
 )
 
@@ -37,6 +42,12 @@ if ($WslStartAttempts -lt 1) {
 }
 if ($MaxConsecutiveRecoveryFailures -lt 1) {
     throw "MaxConsecutiveRecoveryFailures must be at least 1."
+}
+if ($MaxTailscaleRestartFailures -lt 1) {
+    throw "MaxTailscaleRestartFailures must be at least 1."
+}
+if ($TailscaleStartWaitSeconds -lt 0) {
+    throw "TailscaleStartWaitSeconds cannot be negative."
 }
 if ($WslStartRetrySeconds -lt 0) {
     throw "WslStartRetrySeconds cannot be negative."
@@ -95,6 +106,8 @@ function New-DefaultState {
         ConsecutiveRecoveryFailures = 0
         RecoverySuspended = $false
         LastRecoveryFailureOutcome = $null
+        TailscaleConsecutiveRestartFailures = 0
+        TailscaleRecoverySuspended = $false
         LastOutcome = "new"
     }
 }
@@ -331,6 +344,79 @@ function Send-SupervisorAlert {
     }
 }
 
+function Test-TailscaleClientRunning {
+    if ($null -ne $TailscaleProcessProbe) {
+        return [bool](& $TailscaleProcessProbe)
+    }
+    return @(Get-Process -Name "tailscale-ipn" -ErrorAction SilentlyContinue).Count -gt 0
+}
+
+function Invoke-TailscaleWatchdog {
+    param([Parameter(Mandatory = $true)]$State)
+
+    if (Test-TailscaleClientRunning) {
+        if (-not $State.TailscaleRecoverySuspended) {
+            $State.TailscaleConsecutiveRestartFailures = 0
+        }
+        return
+    }
+
+    if ($State.TailscaleRecoverySuspended) {
+        Write-SupervisorLog -Level ERROR -Message "Tailscale client recovery remains suspended after $($State.TailscaleConsecutiveRestartFailures) failures."
+        Send-SupervisorAlert `
+            -Condition "tailscale-remediation-cap-reached" `
+            -Action "Tailscale client is absent and restart attempts are latched off; inspect and reset explicitly." `
+            -State $State
+        return
+    }
+    if ($NoRemediation) {
+        Write-SupervisorLog -Level WARN -Message "Tailscale client is absent, but remediation is disabled for this run."
+        return
+    }
+
+    Write-SupervisorLog -Level WARN -Message "Tailscale client is absent; attempting a bounded restart."
+    try {
+        if ($null -ne $TailscaleStarter) {
+            & $TailscaleStarter
+        }
+        else {
+            Start-Process -FilePath "C:\Program Files\Tailscale\tailscale-ipn.exe" -ErrorAction Stop
+        }
+        if ($TailscaleStartWaitSeconds -gt 0) {
+            Start-Sleep -Seconds $TailscaleStartWaitSeconds
+        }
+    }
+    catch {
+        Write-SupervisorLog -Level WARN -Message "Tailscale client start command failed."
+    }
+
+    if (Test-TailscaleClientRunning) {
+        $State.TailscaleConsecutiveRestartFailures = 0
+        Save-SupervisorState -State $State
+        Write-SupervisorLog -Message "Tailscale client restarted successfully."
+        Send-SupervisorAlert `
+            -Condition "tailscale-client-restarted" `
+            -Action "Windows Tailscale client was absent and has been restarted." `
+            -State $State
+        return
+    }
+
+    $State.TailscaleConsecutiveRestartFailures = [int]$State.TailscaleConsecutiveRestartFailures + 1
+    if ([int]$State.TailscaleConsecutiveRestartFailures -ge $MaxTailscaleRestartFailures) {
+        $State.TailscaleRecoverySuspended = $true
+        Write-SupervisorLog -Level ERROR -Message "Tailscale restart cap reached; further attempts are latched off."
+        Save-SupervisorState -State $State
+        Send-SupervisorAlert `
+            -Condition "tailscale-remediation-cap-reached" `
+            -Action "Tailscale client could not be restarted after $($State.TailscaleConsecutiveRestartFailures) attempts; remediation is latched off." `
+            -State $State
+    }
+    else {
+        Write-SupervisorLog -Level WARN -Message "Tailscale client restart failed ($($State.TailscaleConsecutiveRestartFailures)/$MaxTailscaleRestartFailures)."
+        Save-SupervisorState -State $State
+    }
+}
+
 function Get-HermesRecoveryEvidence {
     param([Parameter(Mandatory = $true)][string]$WslArguments)
 
@@ -456,6 +542,7 @@ function Invoke-HermesRecovery {
 Initialize-DataDirectory
 $State = Read-SupervisorState
 $State.RecoverySuspended = [bool]$State.RecoverySuspended
+$State.TailscaleRecoverySuspended = [bool]$State.TailscaleRecoverySuspended
 if ($ResetRecoverySuspension) {
     $State.ConsecutiveRecoveryFailures = 0
     $State.RecoverySuspended = $false
@@ -465,6 +552,15 @@ if ($ResetRecoverySuspension) {
     Write-SupervisorLog -Message "Recovery suspension was explicitly cleared by an operator."
     exit 0
 }
+if ($ResetTailscaleSuspension) {
+    $State.TailscaleConsecutiveRestartFailures = 0
+    $State.TailscaleRecoverySuspended = $false
+    Save-SupervisorState -State $State
+    Write-SupervisorLog -Message "Tailscale recovery suspension was explicitly cleared by an operator."
+    exit 0
+}
+$script:LastHealthDetail = "Hermes health not checked yet"
+Invoke-TailscaleWatchdog -State $State
 $Now = (Get-Date).ToUniversalTime()
 $State.LastCheckUtc = $Now.ToString("o")
 $Pressure = Get-HostPressure

@@ -269,6 +269,74 @@ try {
         throw "Privilege-blocked recovery was not classified distinctly."
     }
 
+    $TailscaleSuccessDirectory = Join-Path $TestDirectory "tailscale-success"
+    $TailscaleSuccessTracker = [pscustomobject]@{ Running = $false; StartCalls = 0 }
+    $TailscaleSuccessProbe = { $TailscaleSuccessTracker.Running }.GetNewClosure()
+    $TailscaleSuccessStarter = {
+        $TailscaleSuccessTracker.StartCalls++
+        $TailscaleSuccessTracker.Running = $true
+    }.GetNewClosure()
+    & $SupervisorPath `
+        -DataDirectory $TailscaleSuccessDirectory `
+        -AlertConfigPath $AlertConfigPath `
+        -HealthProbe { $true } `
+        -TailscaleProcessProbe $TailscaleSuccessProbe `
+        -TailscaleStarter $TailscaleSuccessStarter `
+        -TailscaleStartWaitSeconds 0 `
+        -AlertTransport $SupervisorTransport
+    $State = Get-Content (Join-Path $TailscaleSuccessDirectory "state.json") -Raw | ConvertFrom-Json
+    $RestartAlert = @($State.AlertLastSentUtc.PSObject.Properties.Match("tailscale-client-restarted"))
+    if ($TailscaleSuccessTracker.StartCalls -ne 1 -or
+        [int]$State.TailscaleConsecutiveRestartFailures -ne 0 -or
+        $State.TailscaleRecoverySuspended -or $RestartAlert.Count -ne 1) {
+        throw "Tailscale successful restart assertion failed."
+    }
+
+    $TailscaleCapDirectory = Join-Path $TestDirectory "tailscale-cap"
+    $TailscaleCapTracker = [pscustomobject]@{ StartCalls = 0 }
+    $TailscaleFailureStarter = { $TailscaleCapTracker.StartCalls++ }.GetNewClosure()
+    1..4 | ForEach-Object {
+        & $SupervisorPath `
+            -DataDirectory $TailscaleCapDirectory `
+            -AlertConfigPath $AlertConfigPath `
+            -HealthProbe { $true } `
+            -TailscaleProcessProbe { $false } `
+            -TailscaleStarter $TailscaleFailureStarter `
+            -TailscaleStartWaitSeconds 0 `
+            -MaxTailscaleRestartFailures 3 `
+            -AlertTransport $SupervisorTransport
+    }
+    $State = Get-Content (Join-Path $TailscaleCapDirectory "state.json") -Raw | ConvertFrom-Json
+    $TailscaleCapAlert = @($State.AlertLastSentUtc.PSObject.Properties.Match("tailscale-remediation-cap-reached"))
+    if ($TailscaleCapTracker.StartCalls -ne 3 -or
+        [int]$State.TailscaleConsecutiveRestartFailures -ne 3 -or
+        -not $State.TailscaleRecoverySuspended -or $TailscaleCapAlert.Count -ne 1) {
+        throw "Tailscale restart cap assertion failed."
+    }
+
+    & $SupervisorPath `
+        -DataDirectory $TailscaleCapDirectory `
+        -ResetTailscaleSuspension `
+        -TailscaleProcessProbe { $false }
+    $State = Get-Content (Join-Path $TailscaleCapDirectory "state.json") -Raw | ConvertFrom-Json
+    if ($State.TailscaleRecoverySuspended -or [int]$State.TailscaleConsecutiveRestartFailures -ne 0) {
+        throw "Explicit Tailscale-suspension reset did not clear the latch."
+    }
+
+    $TailscaleNoRemediationDirectory = Join-Path $TestDirectory "tailscale-no-remediation"
+    $TailscaleNoRemediationTracker = [pscustomobject]@{ StartCalls = 0 }
+    & $SupervisorPath `
+        -DataDirectory $TailscaleNoRemediationDirectory `
+        -HealthProbe { $true } `
+        -TailscaleProcessProbe { $false } `
+        -TailscaleStarter { $TailscaleNoRemediationTracker.StartCalls++ }.GetNewClosure() `
+        -NoRemediation
+    $State = Get-Content (Join-Path $TailscaleNoRemediationDirectory "state.json") -Raw | ConvertFrom-Json
+    if ($TailscaleNoRemediationTracker.StartCalls -ne 0 -or
+        [int]$State.TailscaleConsecutiveRestartFailures -ne 0 -or $State.TailscaleRecoverySuspended) {
+        throw "No-remediation Tailscale check attempted or counted a restart."
+    }
+
     $FixturePath = Join-Path $PSScriptRoot "fixtures\health-detailed.json"
     $FixtureText = Get-Content -LiteralPath $FixturePath -Raw
     $FixturePayload = $FixtureText | ConvertFrom-Json

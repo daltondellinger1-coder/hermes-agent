@@ -16,6 +16,8 @@ Hermes's internal watchdog cannot.
 - State and logs: `C:\Users\Dalton\.hermes-supervisor\data`
 - Out-of-band alerts: Telegram Bot API direct from Windows, rate-limited per
   condition to one message every thirty minutes
+- Tailscale watchdog: restart the Windows `tailscale-ipn.exe` user client when
+  it disappears mid-session, then alert; latch off after three failed starts
 
 Recovery is graded:
 
@@ -39,6 +41,17 @@ The live Scheduled Task currently runs at limited privilege. A hung
 `wsl --shutdown` therefore cannot restart `WslService`; that case is reported
 as `recovery-blocked-privilege`. Do not elevate the task without operator
 approval.
+
+The Tailscale watchdog does not restart the Tailscale service and does not use
+ICMP as a health signal. It only starts the user-mode client when the process is
+absent. After three failed starts it latches off; inspect the client, then clear
+that latch explicitly:
+
+```powershell
+& ".\HermesHostSupervisor.ps1" -ResetTailscaleSuspension
+```
+
+Validate tailnet reachability with `tailscale ping`, not plain `ping`.
 
 High Windows commit, Chrome memory, and WSL memory are logged, but healthy
 Chrome processes are never terminated automatically.
