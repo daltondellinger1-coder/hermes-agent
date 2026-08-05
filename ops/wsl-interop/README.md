@@ -1,9 +1,12 @@
 # WSL interop discovery
 
 `with-wsl-interop` is the canonical socket-discovery implementation used by
-Hermes services and login shells. `--print-socket` prints only a socket proven
+ACP services and agent shells. `--print-socket` prints only a socket proven
 with a real Windows command. The login hook delegates to that mode with a
-one-second outer timeout, so stale sockets cannot block shell startup.
+one-second outer timeout and exports itself as `BASH_ENV`, covering non-login,
+non-interactive Bash descendants. The `buzz-acp@.service` template drop-in
+wraps every current or future ACP instance instead of patching instances one
+at a time.
 
 Install from the repository:
 
@@ -11,5 +14,6 @@ Install from the repository:
 ./Install-WslInteropProfile.sh
 ```
 
-The installer timestamp-backs up replaced files and adds one idempotent source
-line to `~/.profile`.
+The installer timestamp-backs up replaced files, adds one idempotent source
+line to `~/.profile`, installs the ACP template drop-in, and daemon-reloads
+systemd without restarting active agents.
