@@ -370,7 +370,7 @@ function Get-HermesRecoveryEvidence {
         -TimeoutSeconds 12
     $Port = Invoke-ProcessWithTimeout `
         -FilePath "$env:SystemRoot\System32\wsl.exe" `
-        -Arguments "$WslArguments --exec /usr/bin/ss -ltn sport = :8646" `
+        -Arguments "$WslArguments --exec /usr/bin/ss -ltnH sport = :8646" `
         -TimeoutSeconds 12
 
     $GatewayState = if ($Gateway.TimedOut -or $null -eq $Gateway.ExitCode) {
@@ -388,7 +388,7 @@ function Get-HermesRecoveryEvidence {
     $PortState = if ($Port.TimedOut -or $null -eq $Port.ExitCode -or $Port.ExitCode -ne 0) {
         "unknown"
     }
-    elseif (-not [string]::IsNullOrWhiteSpace([string]$Port.Output)) {
+    elseif (@([string]$Port.Output -split "`r?`n" | Where-Object { $_ -match '^LISTEN\s' }).Count -gt 0) {
         "listening"
     }
     else {

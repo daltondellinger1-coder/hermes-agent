@@ -168,6 +168,14 @@ try {
         if ($Arguments -match '/bin/true') {
             return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = ""; Error = "" }
         }
+        if ($Arguments -match 'is-active') {
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = "active"; Error = "" }
+        }
+        if ($Arguments -match '/usr/bin/ss') {
+            # Real zero-match output from `ss -ltn` before -H was added. A
+            # header row must never count as a listening socket.
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process"; Error = "" }
+        }
         [pscustomobject]@{ ExitCode = $null; TimedOut = $true; Output = ""; Error = "timeout" }
     }.GetNewClosure()
     & $SupervisorPath `
