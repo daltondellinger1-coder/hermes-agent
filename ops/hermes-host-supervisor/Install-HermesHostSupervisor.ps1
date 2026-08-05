@@ -160,7 +160,7 @@ catch {
     $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $ExistingAction = @($ExistingTask.Actions | Where-Object { $_.Execute -eq $LauncherPath })
     if ($null -ne $ExistingTask -and $ExistingAction.Count -gt 0) {
-        Write-Warning "Could not replace the existing elevated task, but it already targets the deployed launcher: $LauncherPath"
+        Write-Warning "Could not replace the existing task, but it already targets the deployed launcher: $LauncherPath"
         exit 0
     }
 

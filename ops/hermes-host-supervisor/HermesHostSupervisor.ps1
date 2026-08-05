@@ -307,6 +307,7 @@ function Send-SupervisorAlert {
             -WarningSink { param($Text) Write-SupervisorLog -Level WARN -Message $Text }
         if ($Result.Sent) {
             Save-SupervisorState -State $State
+            Write-SupervisorLog -Message "Hermes alert sent for condition '$Condition' (Telegram API acknowledged)."
         }
     }
     catch {
