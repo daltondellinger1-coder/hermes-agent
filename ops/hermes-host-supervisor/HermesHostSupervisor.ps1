@@ -6,11 +6,19 @@ param(
     [string]$LinuxUser = "dalton",
     [int]$FailureThreshold = 3,
     [int]$RecoveryCooldownMinutes = 20,
+    [int]$MaxConsecutiveRecoveryFailures = 3,
     [int]$WslStartAttempts = 6,
     [int]$WslStartRetrySeconds = 5,
     [string]$DataDirectory = "",
+    [string]$AlertConfigPath = "",
     [switch]$AlwaysLog,
-    [switch]$NoRemediation
+    [switch]$NoRemediation,
+    [switch]$ResetRecoverySuspension,
+    [scriptblock]$HealthProbe,
+    [scriptblock]$ProcessInvoker,
+    [scriptblock]$RecoveryInvoker,
+    [scriptblock]$ServiceRestarter,
+    [scriptblock]$AlertTransport
 )
 
 Set-StrictMode -Version Latest
@@ -26,13 +34,18 @@ if ($FailureThreshold -lt 1) {
 if ($WslStartAttempts -lt 1) {
     throw "WslStartAttempts must be at least 1."
 }
+if ($MaxConsecutiveRecoveryFailures -lt 1) {
+    throw "MaxConsecutiveRecoveryFailures must be at least 1."
+}
 if ($WslStartRetrySeconds -lt 0) {
     throw "WslStartRetrySeconds cannot be negative."
 }
 
 $StatePath = Join-Path $DataDirectory "state.json"
 $LogPath = Join-Path $DataDirectory "supervisor.log"
-$AlertConfigPath = Join-Path $PSScriptRoot "alert.config.json"
+if ([string]::IsNullOrWhiteSpace($AlertConfigPath)) {
+    $AlertConfigPath = Join-Path $PSScriptRoot "alert.config.json"
+}
 $AlertModuleAvailable = $false
 try {
     Import-Module (Join-Path $PSScriptRoot "HermesAlert.psm1") -Force -ErrorAction Stop
@@ -72,6 +85,9 @@ function New-DefaultState {
         LastHealthyUtc = $null
         LastRecoveryUtc = $null
         RecoveryCount = 0
+        ConsecutiveRecoveryFailures = 0
+        RecoverySuspended = $false
+        LastRecoveryFailureOutcome = $null
         LastOutcome = "new"
     }
 }
@@ -107,6 +123,17 @@ function Save-SupervisorState {
 
 function Test-HermesHealth {
     $script:LastHealthDetail = "health probe did not complete"
+    if ($null -ne $HealthProbe) {
+        try {
+            $Result = & $HealthProbe
+            $script:LastHealthDetail = if ($Result) { "stubbed healthy" } else { "stubbed unhealthy" }
+            return [bool]$Result
+        }
+        catch {
+            $script:LastHealthDetail = "stubbed health probe failed"
+            return $false
+        }
+    }
     try {
         $Response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 4
         if ($Response.StatusCode -ne 200) {
@@ -200,6 +227,10 @@ function Invoke-ProcessWithTimeout {
         [Parameter(Mandatory = $true)][string]$Arguments,
         [int]$TimeoutSeconds = 20
     )
+
+    if ($null -ne $ProcessInvoker) {
+        return & $ProcessInvoker $FilePath $Arguments $TimeoutSeconds
+    }
 
     $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
     $StartInfo.FileName = $FilePath
@@ -304,7 +335,8 @@ function Send-SupervisorAlert {
             -Message $Text `
             -State $State `
             -ConfigPath $AlertConfigPath `
-            -WarningSink { param($Text) Write-SupervisorLog -Level WARN -Message $Text }
+            -WarningSink { param($Text) Write-SupervisorLog -Level WARN -Message $Text } `
+            -Transport $AlertTransport
         if ($Result.Sent) {
             Save-SupervisorState -State $State
             Write-SupervisorLog -Message "Hermes alert sent for condition '$Condition' (Telegram API acknowledged)."
@@ -315,31 +347,103 @@ function Send-SupervisorAlert {
     }
 }
 
+function Get-HermesRecoveryEvidence {
+    param([Parameter(Mandatory = $true)][string]$WslArguments)
+
+    $Vm = Invoke-ProcessWithTimeout `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -Arguments "$WslArguments --exec /bin/true" `
+        -TimeoutSeconds 12
+    if ($Vm.TimedOut -or $null -eq $Vm.ExitCode) {
+        return [pscustomobject]@{ Classification = "ambiguous"; Vm = "unknown"; Gateway = "unknown"; Port = "unknown" }
+    }
+    if ($Vm.ExitCode -ne 0) {
+        return [pscustomobject]@{ Classification = "vm-fault"; Vm = "unreachable"; Gateway = "unknown"; Port = "unknown" }
+    }
+
+    $Gateway = Invoke-ProcessWithTimeout `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -Arguments "$WslArguments --exec /usr/bin/systemctl --user is-active hermes-gateway.service" `
+        -TimeoutSeconds 12
+    $Port = Invoke-ProcessWithTimeout `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -Arguments "$WslArguments --exec /usr/bin/ss -ltn sport = :8646" `
+        -TimeoutSeconds 12
+
+    $GatewayState = if ($Gateway.TimedOut -or $null -eq $Gateway.ExitCode) {
+        "unknown"
+    }
+    elseif ($Gateway.ExitCode -eq 0 -and $Gateway.Output -eq "active") {
+        "active"
+    }
+    elseif ($Gateway.Output -match '^(inactive|failed|deactivating)$') {
+        "inactive"
+    }
+    else {
+        "unknown"
+    }
+    $PortState = if ($Port.TimedOut -or $null -eq $Port.ExitCode -or $Port.ExitCode -ne 0) {
+        "unknown"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$Port.Output)) {
+        "listening"
+    }
+    else {
+        "not-listening"
+    }
+
+    $Classification = if ($GatewayState -eq "active" -and $PortState -eq "listening") {
+        "probe-side-fault"
+    }
+    elseif ($GatewayState -eq "inactive") {
+        "gateway-fault"
+    }
+    else {
+        "ambiguous"
+    }
+    [pscustomobject]@{ Classification = $Classification; Vm = "reachable"; Gateway = $GatewayState; Port = $PortState }
+}
+
 function Invoke-HermesRecovery {
     $WslArguments = "--distribution `"$Distro`" --user `"$LinuxUser`""
-    $Probe = Invoke-ProcessWithTimeout -FilePath "$env:SystemRoot\System32\wsl.exe" -Arguments "$WslArguments --exec /bin/true" -TimeoutSeconds 12
+    $Evidence = Get-HermesRecoveryEvidence -WslArguments $WslArguments
+    Write-SupervisorLog -Level WARN -Message "Recovery evidence: classification=$($Evidence.Classification) vm=$($Evidence.Vm) gateway=$($Evidence.Gateway) port=$($Evidence.Port)."
 
-    if (-not $Probe.TimedOut -and $Probe.ExitCode -eq 0) {
-        Write-SupervisorLog -Level WARN -Message "WSL is responsive; restarting only hermes-gateway.service."
+    if ($Evidence.Classification -eq "probe-side-fault" -or $Evidence.Classification -eq "ambiguous") {
+        return $Evidence.Classification
+    }
+
+    if ($Evidence.Classification -eq "gateway-fault") {
+        Write-SupervisorLog -Level WARN -Message "Gateway fault classified; restarting only hermes-gateway.service."
         $Restart = Invoke-ProcessWithTimeout -FilePath "$env:SystemRoot\System32\wsl.exe" -Arguments "$WslArguments --exec /usr/bin/systemctl --user restart hermes-gateway.service" -TimeoutSeconds 30
         if (-not $Restart.TimedOut -and $Restart.ExitCode -eq 0 -and (Wait-ForHermesHealth -TimeoutSeconds 60)) {
             return "gateway-restarted"
         }
-        Write-SupervisorLog -Level WARN -Message "Gateway-only recovery did not restore health; escalating to a WSL restart."
-    }
-    else {
-        Write-SupervisorLog -Level WARN -Message "WSL probe failed or timed out; escalating to a WSL restart."
+        Write-SupervisorLog -Level ERROR -Message "Gateway-only recovery did not restore health; refusing to escalate past the classified gateway fault."
+        return "recovery-failed"
     }
 
+    Write-SupervisorLog -Level WARN -Message "VM fault classified; escalating to a WSL restart."
     $Shutdown = Invoke-ProcessWithTimeout -FilePath "$env:SystemRoot\System32\wsl.exe" -Arguments "--shutdown" -TimeoutSeconds 30
     if ($Shutdown.TimedOut) {
         Write-SupervisorLog -Level WARN -Message "wsl --shutdown timed out; restarting the Windows WslService as the final recovery step."
         try {
-            Restart-Service -Name WslService -Force -ErrorAction Stop
+            if ($null -ne $ServiceRestarter) {
+                & $ServiceRestarter
+            }
+            else {
+                Restart-Service -Name WslService -Force -ErrorAction Stop
+            }
             Start-Sleep -Seconds 5
         }
         catch {
-            Write-SupervisorLog -Level ERROR -Message "WslService restart failed: $($_.Exception.Message)"
+            $PrivilegeBlocked = $_.Exception -is [System.UnauthorizedAccessException] -or
+                $_.Exception.Message -match 'access.*denied|privilege|elevation'
+            if ($PrivilegeBlocked) {
+                Write-SupervisorLog -Level ERROR -Message "WslService restart was blocked by the Scheduled Task privilege level."
+                return "recovery-blocked-privilege"
+            }
+            Write-SupervisorLog -Level ERROR -Message "WslService restart failed."
             return "recovery-failed"
         }
     }
@@ -367,6 +471,16 @@ function Invoke-HermesRecovery {
 
 Initialize-DataDirectory
 $State = Read-SupervisorState
+$State.RecoverySuspended = [bool]$State.RecoverySuspended
+if ($ResetRecoverySuspension) {
+    $State.ConsecutiveRecoveryFailures = 0
+    $State.RecoverySuspended = $false
+    $State.LastRecoveryFailureOutcome = $null
+    $State.LastOutcome = "suspension-reset"
+    Save-SupervisorState -State $State
+    Write-SupervisorLog -Message "Recovery suspension was explicitly cleared by an operator."
+    exit 0
+}
 $Now = (Get-Date).ToUniversalTime()
 $State.LastCheckUtc = $Now.ToString("o")
 $Pressure = Get-HostPressure
@@ -380,7 +494,7 @@ if (Test-HermesHealth) {
     $WasFailing = [int]$State.ConsecutiveFailures -gt 0
     $State.ConsecutiveFailures = 0
     $State.LastHealthyUtc = $Now.ToString("o")
-    $State.LastOutcome = "healthy"
+    $State.LastOutcome = if ($State.RecoverySuspended) { "suspended" } else { "healthy" }
     Save-SupervisorState -State $State
     if ($WasFailing) {
         Write-SupervisorLog -Message "Hermes recovered before remediation was required."
@@ -397,6 +511,17 @@ Save-SupervisorState -State $State
 Write-SupervisorLog -Level WARN -Message "Hermes health check failed ($($State.ConsecutiveFailures)/$FailureThreshold): $script:LastHealthDetail."
 
 if ([int]$State.ConsecutiveFailures -lt $FailureThreshold) {
+    exit 0
+}
+
+if ($State.RecoverySuspended) {
+    $State.LastOutcome = "suspended"
+    Save-SupervisorState -State $State
+    Write-SupervisorLog -Level ERROR -Message "Recovery remains suspended after $($State.ConsecutiveRecoveryFailures) consecutive recovery failures."
+    Send-SupervisorAlert `
+        -Condition "remediation-cap-reached" `
+        -Action "Remediation is latched off; clear it explicitly after inspection." `
+        -State $State
     exit 0
 }
 
@@ -434,10 +559,12 @@ Send-SupervisorAlert `
     -Action "Beginning graded recovery." `
     -State $State
 
-$Outcome = Invoke-HermesRecovery
+$Outcome = if ($null -ne $RecoveryInvoker) { & $RecoveryInvoker } else { Invoke-HermesRecovery }
 $State.LastOutcome = $Outcome
 if ($Outcome -eq "gateway-restarted" -or $Outcome -eq "wsl-restarted") {
     $State.ConsecutiveFailures = 0
+    $State.ConsecutiveRecoveryFailures = 0
+    $State.LastRecoveryFailureOutcome = $null
     $State.LastHealthyUtc = (Get-Date).ToUniversalTime().ToString("o")
     Write-SupervisorLog -Message "Hermes recovery succeeded: $Outcome."
     Send-RecoveryNotice -Message "Hermes recovered automatically ($Outcome)."
@@ -446,12 +573,37 @@ if ($Outcome -eq "gateway-restarted" -or $Outcome -eq "wsl-restarted") {
         -Action "Recovery completed: $Outcome." `
         -State $State
 }
-else {
-    Write-SupervisorLog -Level ERROR -Message "Hermes recovery failed; manual inspection is required."
-    Send-RecoveryNotice -Message "Hermes automatic recovery failed. Check the Hermes supervisor log."
+elseif ($Outcome -eq "probe-side-fault" -or $Outcome -eq "ambiguous") {
+    Write-SupervisorLog -Level ERROR -Message "Recovery declined: $Outcome. Independent evidence does not justify destructive remediation."
     Send-SupervisorAlert `
-        -Condition "recovery-failed" `
-        -Action "Automatic recovery failed; manual inspection is required." `
+        -Condition $Outcome `
+        -Action "Independent evidence is $Outcome; no remediation was performed." `
         -State $State
+}
+else {
+    $State.ConsecutiveRecoveryFailures = [int]$State.ConsecutiveRecoveryFailures + 1
+    $State.LastRecoveryFailureOutcome = $Outcome
+    $FailureAction = if ($Outcome -eq "recovery-blocked-privilege") {
+        "Recovery was blocked by task privileges; re-register elevated only after operator approval."
+    }
+    else {
+        "Automatic recovery failed; manual inspection is required."
+    }
+    Write-SupervisorLog -Level ERROR -Message "$FailureAction Failure count: $($State.ConsecutiveRecoveryFailures)/$MaxConsecutiveRecoveryFailures."
+    Send-RecoveryNotice -Message $FailureAction
+    Send-SupervisorAlert `
+        -Condition $Outcome `
+        -Action $FailureAction `
+        -State $State
+    if ([int]$State.ConsecutiveRecoveryFailures -ge $MaxConsecutiveRecoveryFailures) {
+        $State.RecoverySuspended = $true
+        $State.LastOutcome = "suspended"
+        Save-SupervisorState -State $State
+        Write-SupervisorLog -Level ERROR -Message "Remediation cap reached; destructive recovery is now latched off."
+        Send-SupervisorAlert `
+            -Condition "remediation-cap-reached" `
+            -Action "Remediation is latched off after $($State.ConsecutiveRecoveryFailures) failures; inspect and reset explicitly." `
+            -State $State
+    }
 }
 Save-SupervisorState -State $State

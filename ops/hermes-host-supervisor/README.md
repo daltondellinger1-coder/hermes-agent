@@ -19,11 +19,26 @@ Hermes's internal watchdog cannot.
 
 Recovery is graded:
 
-1. If WSL responds, restart only `hermes-gateway.service`.
-2. If that fails, run `wsl --shutdown`, retry starting Ubuntu across the WSL
-   shutdown/start race, and wait for Hermes.
-3. If `wsl --shutdown` hangs, restart `WslService` only when the Scheduled Task
-   was installed from an elevated PowerShell session.
+1. Gather independent VM, gateway-unit, and health-port evidence.
+2. If only the gateway is down, restart only `hermes-gateway.service` and never
+   escalate beyond it on that path.
+3. Only a classified VM fault may invoke `wsl --shutdown`, retry starting
+   Ubuntu across the shutdown/start race, and wait for Hermes.
+4. Probe-side faults, ambiguous evidence, and privilege-blocked recovery page
+   Dalton and fail closed instead of escalating.
+
+After three consecutive failed recovery attempts, remediation latches into
+`suspended`. Healthy checks do not clear this safety latch. After inspecting
+and correcting the cause, clear it explicitly from the live directory:
+
+```powershell
+& ".\HermesHostSupervisor.ps1" -ResetRecoverySuspension
+```
+
+The live Scheduled Task currently runs at limited privilege. A hung
+`wsl --shutdown` therefore cannot restart `WslService`; that case is reported
+as `recovery-blocked-privilege`. Do not elevate the task without operator
+approval.
 
 High Windows commit, Chrome memory, and WSL memory are logged, but healthy
 Chrome processes are never terminated automatically.
