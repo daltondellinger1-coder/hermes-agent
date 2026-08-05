@@ -80,6 +80,23 @@ try {
         throw "A healthy check did not reset the failure counter."
     }
 
+    $LegacyDirectory = Join-Path $TestDirectory "legacy-state"
+    New-Item -ItemType Directory -Path $LegacyDirectory -Force | Out-Null
+    [pscustomobject]@{
+        ConsecutiveFailures = 0
+        LastCheckUtc = $null
+        LastHealthyUtc = $null
+        LastRecoveryUtc = $null
+        RecoveryCount = 67
+        LastOutcome = "healthy"
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $LegacyDirectory "state.json") -Encoding UTF8
+    & $SupervisorPath -DataDirectory $LegacyDirectory -NoRemediation -HealthProbe { $true }
+    $State = Get-Content (Join-Path $LegacyDirectory "state.json") -Raw | ConvertFrom-Json
+    if ($null -eq $State.ConsecutiveRecoveryFailures -or
+        [int]$State.ConsecutiveRecoveryFailures -ne 0 -or $State.RecoverySuspended) {
+        throw "Legacy state did not migrate recovery-cap fields to safe defaults."
+    }
+
     $ProbeFaultDirectory = Join-Path $TestDirectory "probe-fault"
     $ProbeTracker = [pscustomobject]@{ ShutdownCalls = 0 }
     $AllGoodEvidence = {
